@@ -33,7 +33,7 @@ use bevy::render::render_resource::binding_types::{
 use bevy::render::texture::{BevyDefault, GpuImage};
 use bevy::render::view::{check_visibility, ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms, VisibleEntities};
 use bevy::render::Extract;
-use bevy::window::WindowRef;
+use bevy::window::{PrimaryWindow, WindowRef};
 use bevy::{
     prelude::*,
     render::{
@@ -72,8 +72,7 @@ impl Plugin for NannouArtnetPlugin {
         );
 
         app.add_plugins((
-            // ExtractComponentPlugin::<ScreenTexture>::default(),
-            // ExtractComponentPlugin::<ScreenTextureCamera>::default(),
+            MaterialPlugin::<LedMaterial>::default(),
         ))
         .add_systems(PostUpdate, check_visibility::<With<LedZone>>)
         .add_systems(First, spawn_screen_textures);
@@ -110,12 +109,12 @@ impl Plugin for NannouArtnetPlugin {
 }
 
 #[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-struct LedMaterial {
+pub struct LedMaterial {
     #[uniform(0)]
-    color: LinearRgba,
+    pub color: LinearRgba,
     #[texture(1)]
     #[sampler(2)]
-    color_texture: Option<Handle<Image>>,
+    pub color_texture: Option<Handle<Image>>,
 }
 
 impl Material for LedMaterial {
@@ -156,13 +155,21 @@ fn spawn_screen_textures(
     camera_q: Query<(Entity, &Camera), Without<ScreenTextureCamera>>,
     mut images: ResMut<Assets<Image>>,
     windows_q: Query<&Window>,
+    primary_window_q: Query<&Window, With<PrimaryWindow>>,
 ) {
     for (entity, cam) in camera_q.iter() {
-        let RenderTarget::Window(WindowRef::Entity(window_ref)) = cam.target else {
+        let RenderTarget::Window(window_target) = cam.target else {
             panic!("Camera target should be a window");
         };
+        let window = match window_target {
+            WindowRef::Primary => {
+                primary_window_q.single()
+            }
+            WindowRef::Entity(window) => {
+                windows_q.get(window).unwrap()
+            }
+        };
 
-        let window = windows_q.get(window_ref).expect("window should exist");
         let size = Extent3d {
             width: window.physical_width(),
             height: window.physical_height(),
@@ -226,16 +233,16 @@ struct CpuReadbackBuffers(EntityHashMap<RawBufferVec<LinearRgba>>);
 struct ScreenTextureCamera;
 
 #[derive(Component, ExtractComponent, Clone)]
-struct ScreenTexture(Handle<Image>);
+pub struct ScreenTexture(pub Handle<Image>);
 
 #[derive(Resource, Deref, DerefMut, Default)]
 struct ComputeBindGroups(EntityHashMap<BindGroup>);
 
 #[derive(Component)]
 pub struct LedZone {
-    count: u32,
-    position: Vec2,
-    size: Vec2,
+    pub count: u32,
+    pub position: Vec2,
+    pub size: Vec2,
 }
 
 #[derive(Component, Deref, DerefMut, Default)]
