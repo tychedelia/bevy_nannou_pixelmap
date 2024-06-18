@@ -8,3 +8,7 @@ bevy = { path = "../../bevyengine/bevy" }
 crossbeam-channel = "0.5.13"
 socket2 =  {  version = "0.5.7", features = ["all"] }
 artnet_protocol = "0.4.2"
+
+[[example]]
+name = "test"
+path = "examples/test.rs"

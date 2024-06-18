@@ -27,11 +27,11 @@ use bevy::render::render_phase::{
     AddRenderCommand, PhaseItem, RenderCommand, RenderCommandResult, SetItemPipeline,
     TrackedRenderPass,
 };
-use bevy::render::render_resource::binding_types::{sampler, texture_2d, uniform_buffer};
-use bevy::render::texture::{BevyDefault, GpuImage};
-use bevy::render::view::{
-    check_visibility, ExtractedView, ViewTarget, ViewUniformOffset, VisibleEntities,
+use bevy::render::render_resource::binding_types::{
+    sampler, storage_buffer_read_only, texture_2d, uniform_buffer,
 };
+use bevy::render::texture::{BevyDefault, GpuImage};
+use bevy::render::view::{check_visibility, ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms, VisibleEntities};
 use bevy::render::Extract;
 use bevy::window::WindowRef;
 use bevy::{
@@ -74,9 +74,8 @@ impl Plugin for NannouArtnetPlugin {
         app.add_plugins((
             // ExtractComponentPlugin::<ScreenTexture>::default(),
             // ExtractComponentPlugin::<ScreenTextureCamera>::default(),
-            UniformComponentPlugin::<LedUniform>::default(),
         ))
-        .add_systems(PostUpdate, check_visibility::<With<Leds>>)
+        .add_systems(PostUpdate, check_visibility::<With<LedZone>>)
         .add_systems(First, spawn_screen_textures);
     }
 
@@ -88,7 +87,10 @@ impl Plugin for NannouArtnetPlugin {
         render_app
             .insert_resource(RenderWorldSender(s))
             .init_resource::<ComputePipeline>()
-            .init_resource::<ComputeBuffers>()
+            .init_resource::<WorkItemBuffers>()
+            .init_resource::<GpuOutputBuffers>()
+            .init_resource::<CpuReadbackBuffers>()
+            .init_resource::<ComputeBindGroups>()
             .add_systems(
                 Render,
                 (
@@ -114,25 +116,20 @@ struct LedMaterial {
     #[texture(1)]
     #[sampler(2)]
     color_texture: Option<Handle<Image>>,
-    alpha_mode: AlphaMode,
 }
 
 impl Material for LedMaterial {
     fn fragment_shader() -> ShaderRef {
         ShaderRef::Handle(MATERIAL_SHADER_HANDLE)
     }
-
-    fn alpha_mode(&self) -> AlphaMode {
-        self.alpha_mode
-    }
 }
 
 type DrawLedMaterial = (
     SetItemPipeline,
-    SetMeshViewBindGroup<0>,
     SetMeshBindGroup<1>,
     SetMaterialBindGroup<LedMaterial, 2>,
     SetBufferBindGroup<3>,
+    SetMeshViewBindGroup<0>,
     DrawMesh,
 );
 
@@ -216,11 +213,14 @@ fn receive(receiver: Res<MainWorldReceiver>) {
     }
 }
 
-#[derive(Resource, Default)]
-struct ComputeBuffers {
-    gpu_buffers: EntityHashMap<RawBufferVec<LinearRgba>>,
-    cpu_buffers: EntityHashMap<RawBufferVec<LinearRgba>>,
-}
+#[derive(Resource, Deref, DerefMut, Default)]
+struct WorkItemBuffers(EntityHashMap<BufferVec<LedWorkItem>>);
+
+#[derive(Resource, Deref, DerefMut, Default)]
+struct GpuOutputBuffers(EntityHashMap<UninitBufferVec<LinearRgba>>);
+
+#[derive(Resource, Deref, DerefMut, Default)]
+struct CpuReadbackBuffers(EntityHashMap<RawBufferVec<LinearRgba>>);
 
 #[derive(Component, ExtractComponent, Clone)]
 struct ScreenTextureCamera;
@@ -228,27 +228,75 @@ struct ScreenTextureCamera;
 #[derive(Component, ExtractComponent, Clone)]
 struct ScreenTexture(Handle<Image>);
 
-#[derive(Resource, Deref, DerefMut)]
+#[derive(Resource, Deref, DerefMut, Default)]
 struct ComputeBindGroups(EntityHashMap<BindGroup>);
 
 #[derive(Component)]
-pub struct Leds {}
+pub struct LedZone {
+    count: u32,
+    position: Vec2,
+    size: Vec2,
+}
+
+#[derive(Component, Deref, DerefMut, Default)]
+pub struct ViewLeds(pub Vec<LedWorkItem>);
 
 fn extract_leds(
     mut commands: Commands,
-    views: Extract<Query<(Entity, &VisibleEntities)>>,
-    leds: Extract<Query<(&Leds)>>,
+    views: Extract<Query<(Entity, &ExtractedView, &VisibleEntities)>>,
+    leds: Extract<Query<&LedZone>>,
 ) {
-    for (view_entity, visible_entities) in views.iter() {}
+    for (view_entity, view, visible_entities) in views.iter() {
+        let mut view_leds = ViewLeds::default();
+        for visible in visible_entities.iter::<With<LedZone>>() {
+            if let Ok(led) = leds.get(*visible) {
+                view_leds.push(LedWorkItem {
+                    start_index: 0,
+                    num_leds: led.count,
+                    num_samples: 1,
+                    total_area_size: led.size,
+                    area_position: led.position,
+                });
+            }
+        }
+    }
+}
+
+fn prepare_buffers(
+    mut work_items: ResMut<WorkItemBuffers>,
+    mut gpu_output: ResMut<GpuOutputBuffers>,
+    mut cpu_readback: ResMut<CpuReadbackBuffers>,
+    mut views: Query<(Entity, &mut ViewLeds)>,
+) {
+    for (entity, mut leds) in &mut views {
+        let (Some(mut work_items), Some(mut gpu_output)) =
+            (work_items.get_mut(&entity), gpu_output.get_mut(&entity))
+        else {
+            continue;
+        };
+
+        work_items.clear();
+        gpu_output.clear();
+
+        for led in leds.drain(..) {
+            let mut offset_index = gpu_output.len();
+            for _ in 0..led.num_leds {
+                offset_index += gpu_output.add();
+            }
+
+            work_items.push(led);
+        }
+    }
 }
 
 fn prepare_bind_groups(
     views: Query<(Entity, &ExtractedView, &ScreenTexture)>,
-    uniforms: Res<ComponentUniforms<LedUniform>>,
+    view_uniforms: Res<ViewUniforms>,
     gpu_images: Res<RenderAssets<GpuImage>>,
     pipeline: Res<ComputePipeline>,
     render_device: Res<RenderDevice>,
-    buffers: Res<ComputeBuffers>,
+    work_items: Res<WorkItemBuffers>,
+    gpu_output: Res<GpuOutputBuffers>,
     mut bind_groups: ResMut<ComputeBindGroups>,
 ) {
     for (entity, view, screen_texture) in &views {
@@ -256,7 +304,7 @@ fn prepare_bind_groups(
             .get(&screen_texture.0)
             .expect("image should exist");
 
-        let Some(uniforms_binding) = uniforms.uniforms().binding() else {
+        let Some(view_uniforms_binding) = view_uniforms.uniforms.binding() else {
             continue;
         };
 
@@ -265,15 +313,19 @@ fn prepare_bind_groups(
             &pipeline.layout,
             &BindGroupEntries::sequential((
                 screen_texture.texture_view.into_binding(),
-                screen_texture.sampler.into_binding(),
-                buffers
-                    .gpu_buffers
+                gpu_output
                     .get(&entity)
                     .expect("buffer should exist")
                     .buffer()
                     .expect("buffer should exist")
                     .as_entire_binding(),
-                uniforms_binding,
+                work_items
+                    .get(&entity)
+                    .expect("buffer should exist")
+                    .buffer()
+                    .expect("buffer should exist")
+                    .as_entire_binding(),
+                view_uniforms_binding.into_binding(),
             )),
         );
 
@@ -287,19 +339,13 @@ struct ComputePipeline {
     pipeline: CachedComputePipelineId,
 }
 
-#[derive(ShaderType, Clone)]
-struct LedSettings {
+#[derive(Component, ShaderType, Clone)]
+pub struct LedWorkItem {
+    start_index: u32,
     num_leds: u32,
     num_samples: u32,
     total_area_size: Vec2,
     area_position: Vec2,
-}
-
-#[derive(Component, ShaderType, Clone)]
-struct LedUniform {
-    screen_resolution: Vec2,
-    #[size(runtime)]
-    led_settings: Vec<LedSettings>,
 }
 
 impl FromWorld for ComputePipeline {
@@ -311,15 +357,15 @@ impl FromWorld for ComputePipeline {
                 ShaderStages::COMPUTE,
                 (
                     texture_2d(TextureSampleType::Float { filterable: true }),
-                    sampler(SamplerBindingType::Filtering),
                     storage_buffer::<LinearRgba>(false),
-                    uniform_buffer::<LedUniform>(true),
+                    storage_buffer_read_only::<LedWorkItem>(false),
+                    uniform_buffer::<ViewUniform>(true)
                 ),
             ),
         );
         let pipeline_cache = world.resource::<PipelineCache>();
         let pipeline = pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
-            label: Some("GPU readback compute shader".into()),
+            label: Some("led_material_compute".into()),
             layout: vec![layout.clone()],
             push_constant_ranges: Vec::new(),
             shader: COMPUTE_SHADER_HANDLE.clone(),
@@ -330,11 +376,7 @@ impl FromWorld for ComputePipeline {
     }
 }
 
-fn map_and_read_buffer(
-    render_device: Res<RenderDevice>,
-    buffers: Res<ComputeBuffers>,
-    sender: Res<RenderWorldSender>,
-) {
+fn map_and_read_buffer(render_device: Res<RenderDevice>, sender: Res<RenderWorldSender>) {
     // let buffer_slice = buffers
     //     .cpu_buffers
     //     .buffer()
@@ -379,24 +421,29 @@ struct ComputeNodeLabel;
 /// The node that will execute the compute shader
 #[derive(Default)]
 struct ComputeNode {}
-impl render_graph::ViewNode for ComputeNode {
-    type ViewQuery = (Entity);
+impl ViewNode for ComputeNode {
+    type ViewQuery = (Entity, Read<ViewUniformOffset>);
 
     fn run<'w>(
         &self,
         graph: &mut RenderGraphContext,
         render_context: &mut RenderContext<'w>,
-        (view_entity): QueryItem<'w, Self::ViewQuery>,
+        (view_entity, view_uniform): QueryItem<'w, Self::ViewQuery>,
         world: &'w World,
     ) -> Result<(), NodeRunError> {
         let pipeline_cache = world.resource::<PipelineCache>();
         let pipeline = world.resource::<ComputePipeline>();
         let bind_groups = world.resource::<ComputeBindGroups>();
-        let buffers = world.resource::<ComputeBuffers>();
-        let Some(gpu_buffer) = buffers.gpu_buffers.get(&view_entity) else {
+        let work_items = world.resource::<WorkItemBuffers>();
+        let gpu_output = world.resource::<GpuOutputBuffers>();
+        let cpu_readback = world.resource::<CpuReadbackBuffers>();
+        let Some(work_items) = work_items.get(&view_entity) else {
             return Ok(());
         };
-        let Some(cpu_buffer) = buffers.cpu_buffers.get(&view_entity) else {
+        let Some(gpu_buffer) = gpu_output.get(&view_entity) else {
+            return Ok(());
+        };
+        let Some(cpu_buffer) = cpu_readback.get(&view_entity) else {
             return Ok(());
         };
 
@@ -412,10 +459,10 @@ impl render_graph::ViewNode for ComputeNode {
             pass.set_bind_group(
                 0,
                 bind_groups.get(&view_entity).as_ref().unwrap().clone(),
-                &[],
+                &[view_uniform.offset],
             );
             pass.set_pipeline(init_pipeline);
-            pass.dispatch_workgroups(gpu_buffer.capacity() as u32, 1, 1);
+            pass.dispatch_workgroups(work_items.capacity() as u32, 1, 1);
         }
 
         render_context.command_encoder().copy_buffer_to_buffer(
@@ -423,7 +470,7 @@ impl render_graph::ViewNode for ComputeNode {
             0,
             &cpu_buffer.buffer().expect("buffer should exist"),
             0,
-            (gpu_buffer.capacity() * std::mem::size_of::<LinearRgba>()) as u64,
+            (gpu_buffer.len() * std::mem::size_of::<LinearRgba>()) as u64,
         );
 
         Ok(())
