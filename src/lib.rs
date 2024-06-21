@@ -1,49 +1,48 @@
-mod artnet;
-mod compute;
-mod material;
-
+use bevy::{
+    prelude::*,
+    render::{
+        Render,
+        render_graph::{self, RenderGraph, RenderLabel},
+        render_resource::{*, binding_types::storage_buffer},
+        RenderApp, renderer::{RenderContext, RenderDevice}, RenderSet,
+    },
+};
 use bevy::asset::load_internal_asset;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy::core_pipeline::core_3d::Transparent3d;
 use bevy::ecs::entity::EntityHashMap;
 use bevy::ecs::query::{QueryItem, ROQueryItem};
-use bevy::ecs::system::lifetimeless::Read;
+use bevy::ecs::system::lifetimeless::{Read, SRes};
 use bevy::ecs::system::SystemParamItem;
-use bevy::pbr::{
-    DrawMesh, MeshViewBindGroup, SetMaterialBindGroup, SetMeshBindGroup, SetMeshViewBindGroup,
-    ViewFogUniformOffset, ViewLightProbesUniformOffset, ViewLightsUniformOffset,
-    ViewScreenSpaceReflectionsUniformOffset,
-};
+use bevy::pbr::{DrawMesh, MeshPipeline, MeshPipelineKey, MeshUniform, MeshViewBindGroup, PreparedMaterial, RenderMeshInstances, SetMeshBindGroup, SetMeshViewBindGroup, ViewFogUniformOffset, ViewLightProbesUniformOffset, ViewLightsUniformOffset, ViewScreenSpaceReflectionsUniformOffset};
 use bevy::render::camera::RenderTarget;
+use bevy::render::Extract;
 use bevy::render::extract_component::{
     ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
     UniformComponentPlugin,
 };
-use bevy::render::render_asset::RenderAssets;
+use bevy::render::extract_instances::ExtractInstancesPlugin;
+use bevy::render::mesh::{GpuMesh, MeshVertexBufferLayoutRef};
+use bevy::render::render_asset::{RenderAssetPlugin, RenderAssets};
 use bevy::render::render_graph::{
     NodeRunError, RenderGraphApp, RenderGraphContext, ViewNode, ViewNodeRunner,
 };
 use bevy::render::render_phase::{
-    AddRenderCommand, PhaseItem, RenderCommand, RenderCommandResult, SetItemPipeline,
-    TrackedRenderPass,
+    AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand,
+    RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
 };
 use bevy::render::render_resource::binding_types::{
     sampler, storage_buffer_read_only, texture_2d, uniform_buffer,
 };
-use bevy::render::texture::{BevyDefault, GpuImage};
-use bevy::render::view::{check_visibility, ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms, VisibleEntities};
-use bevy::render::Extract;
+use bevy::render::renderer::RenderQueue;
+use bevy::render::texture::{BevyDefault, FallbackImage, GpuImage};
+use bevy::render::view::{check_visibility, ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms, VisibleEntities, WithMesh};
 use bevy::window::{PrimaryWindow, WindowRef};
-use bevy::{
-    prelude::*,
-    render::{
-        render_graph::{self, RenderGraph, RenderLabel},
-        render_resource::{binding_types::storage_buffer, *},
-        renderer::{RenderContext, RenderDevice},
-        Render, RenderApp, RenderSet,
-    },
-};
 use crossbeam_channel::{Receiver, Sender};
+
+mod artnet;
+mod compute;
+mod material;
 
 #[derive(Resource, Deref)]
 struct MainWorldReceiver(Receiver<Vec<u32>>);
@@ -71,8 +70,11 @@ impl Plugin for NannouArtnetPlugin {
             Shader::from_wgsl
         );
 
-        app.add_plugins((
-            MaterialPlugin::<LedMaterial>::default(),
+        app
+            .add_plugins((
+            ExtractComponentPlugin::<LedZone>::default(),
+            ExtractComponentPlugin::<ScreenTexture>::default(),
+            ExtractComponentPlugin::<ScreenTextureCamera>::default(),
         ))
         .add_systems(PostUpdate, check_visibility::<With<LedZone>>)
         .add_systems(First, spawn_screen_textures);
@@ -93,13 +95,16 @@ impl Plugin for NannouArtnetPlugin {
             .add_systems(
                 Render,
                 (
+                    queue_led_material.in_set(RenderSet::QueueMeshes),
+                    queue_leds.in_set(RenderSet::Queue),
+                    prepare_buffers.in_set(RenderSet::PrepareResources),
                     prepare_bind_groups.in_set(RenderSet::PrepareBindGroups),
                     map_and_read_buffer.after(RenderSet::Render),
                 ),
-            );
-
-        render_app
+            )
             .add_render_command::<Transparent3d, DrawLedMaterial>()
+            .init_resource::<SpecializedMeshPipelines<LedMaterialPipeline>>()
+            .init_resource::<LedMaterialPipeline>()
             .add_render_graph_node::<ViewNodeRunner<ComputeNode>>(Core3d, ComputeNodeLabel)
             .add_render_graph_edges(
                 Core3d,
@@ -108,51 +113,41 @@ impl Plugin for NannouArtnetPlugin {
     }
 }
 
-#[derive(Asset, TypePath, AsBindGroup, Debug, Clone)]
-pub struct LedMaterial {
-    #[uniform(0)]
-    pub color: LinearRgba,
-    #[texture(1)]
-    #[sampler(2)]
-    pub color_texture: Option<Handle<Image>>,
-}
-
-impl Material for LedMaterial {
-    fn fragment_shader() -> ShaderRef {
-        ShaderRef::Handle(MATERIAL_SHADER_HANDLE)
-    }
-}
-
 type DrawLedMaterial = (
     SetItemPipeline,
-    SetMeshBindGroup<1>,
-    SetMaterialBindGroup<LedMaterial, 2>,
-    SetBufferBindGroup<3>,
     SetMeshViewBindGroup<0>,
+    SetMeshBindGroup<1>,
+    SetMaterialBindGroup<2>,
     DrawMesh,
 );
 
-pub struct SetBufferBindGroup<const I: usize>;
-impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetBufferBindGroup<I> {
+pub struct SetMaterialBindGroup<const I: usize>;
+impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMaterialBindGroup<I> {
     type Param = ();
-    type ViewQuery = ();
-    type ItemQuery = ();
+    type ViewQuery = (Entity);
+    type ItemQuery = (Read<LedMaterialBindGroup>);
 
     #[inline]
     fn render<'w>(
         _item: &P,
-        _view_query: ROQueryItem<'w, Self::ViewQuery>,
-        _entity: Option<()>,
+        (view_entity): ROQueryItem<'w, Self::ViewQuery>,
+        (bind_group): Option<ROQueryItem<'w, Self::ItemQuery>>,
         _: SystemParamItem<'w, '_, Self::Param>,
         pass: &mut TrackedRenderPass<'w>,
     ) -> RenderCommandResult {
+        let Some(bind_group) = bind_group else {
+            return RenderCommandResult::Failure;
+        };
+
+        info!("Setting bind group for entity {view_entity:?}");
+        pass.set_bind_group(I, &bind_group.0, &[]);
         RenderCommandResult::Success
     }
 }
 
 fn spawn_screen_textures(
     mut commands: Commands,
-    camera_q: Query<(Entity, &Camera), Without<ScreenTextureCamera>>,
+    camera_q: Query<(Entity, &Camera), (Without<ScreenTexture>, Without<ScreenTextureCamera>)>,
     mut images: ResMut<Assets<Image>>,
     windows_q: Query<&Window>,
     primary_window_q: Query<&Window, With<PrimaryWindow>>,
@@ -162,12 +157,8 @@ fn spawn_screen_textures(
             panic!("Camera target should be a window");
         };
         let window = match window_target {
-            WindowRef::Primary => {
-                primary_window_q.single()
-            }
-            WindowRef::Entity(window) => {
-                windows_q.get(window).unwrap()
-            }
+            WindowRef::Primary => primary_window_q.single(),
+            WindowRef::Entity(window) => windows_q.get(window).unwrap(),
         };
 
         let size = Extent3d {
@@ -198,7 +189,7 @@ fn spawn_screen_textures(
         image.resize(size);
         let image = images.add(image);
 
-        commands.spawn((
+        let screen_texture_camera = commands.spawn((
             Camera3dBundle {
                 camera: Camera {
                     order: cam.order - 1, // always render before the camera
@@ -208,9 +199,9 @@ fn spawn_screen_textures(
                 ..default()
             },
             ScreenTextureCamera,
-        ));
+        )).id();
 
-        commands.entity(entity).insert(ScreenTexture(image));
+        commands.entity(entity).insert((ScreenTexture(image), ScreenTextureCameraRef(screen_texture_camera)));
     }
 }
 
@@ -232,40 +223,76 @@ struct CpuReadbackBuffers(EntityHashMap<RawBufferVec<LinearRgba>>);
 #[derive(Component, ExtractComponent, Clone)]
 struct ScreenTextureCamera;
 
+#[derive(Component, Clone)]
+struct ScreenTextureCameraRef(pub Entity);
+
 #[derive(Component, ExtractComponent, Clone)]
 pub struct ScreenTexture(pub Handle<Image>);
 
 #[derive(Resource, Deref, DerefMut, Default)]
 struct ComputeBindGroups(EntityHashMap<BindGroup>);
 
-#[derive(Component)]
+#[derive(Component, ExtractComponent, Clone)]
 pub struct LedZone {
     pub count: u32,
     pub position: Vec2,
     pub size: Vec2,
 }
 
-#[derive(Component, Deref, DerefMut, Default)]
-pub struct ViewLeds(pub Vec<LedWorkItem>);
+#[derive(AsBindGroup, Debug, Clone)]
+pub struct LedMaterial {
+    #[uniform(0)]
+    pub offset: u32,
+    #[uniform(0)]
+    pub count: u32,
+    #[storage(1, read_only, buffer)]
+    pub color_buffer: Buffer,
+}
 
-fn extract_leds(
+#[derive(Component)]
+pub struct LedMaterialBindGroup(pub BindGroup);
+
+#[derive(Component, Default, Debug)]
+pub struct ViewLeds {
+    work_items: EntityHashMap<LedWorkItem>,
+    materials: EntityHashMap<LedMaterial>,
+}
+
+fn queue_leds(
     mut commands: Commands,
-    views: Extract<Query<(Entity, &ExtractedView, &VisibleEntities)>>,
-    leds: Extract<Query<&LedZone>>,
+    views: Query<(Entity, &ExtractedView, &VisibleEntities), Without<ScreenTextureCamera>>,
+    gpu_output: Res<GpuOutputBuffers>,
+    leds: Query<&LedZone>,
 ) {
     for (view_entity, view, visible_entities) in views.iter() {
+        info!("Extracting leds for entity {view_entity:?}");
         let mut view_leds = ViewLeds::default();
-        for visible in visible_entities.iter::<With<LedZone>>() {
+        for (idx, visible ) in visible_entities.iter::<WithMesh>().enumerate() {
             if let Ok(led) = leds.get(*visible) {
-                view_leds.push(LedWorkItem {
+                view_leds.work_items.insert(*visible, LedWorkItem {
                     start_index: 0,
                     num_leds: led.count,
                     num_samples: 1,
                     total_area_size: led.size,
                     area_position: led.position,
                 });
+
+                let Some(gpu_output) = gpu_output.get(&view_entity) else {
+                    continue;
+                };
+                let Some(buffer) = gpu_output.buffer() else {
+                    continue;
+                };
+
+                view_leds.materials.insert(*visible, LedMaterial {
+                    offset: idx as u32,
+                    count: led.count,
+                    color_buffer: buffer.clone(),
+                });
             }
         }
+        info!("Inserting leds for entity {view_entity:?}: {view_leds:?} leds");
+        commands.entity(view_entity).insert(view_leds);
     }
 }
 
@@ -273,19 +300,23 @@ fn prepare_buffers(
     mut work_items: ResMut<WorkItemBuffers>,
     mut gpu_output: ResMut<GpuOutputBuffers>,
     mut cpu_readback: ResMut<CpuReadbackBuffers>,
-    mut views: Query<(Entity, &mut ViewLeds)>,
+    mut views: Query<(Entity, &mut ViewLeds), With<ExtractedView>>,
 ) {
     for (entity, mut leds) in &mut views {
-        let (Some(mut work_items), Some(mut gpu_output)) =
-            (work_items.get_mut(&entity), gpu_output.get_mut(&entity))
-        else {
-            continue;
-        };
+        info!("Preparing buffers for entity {entity:?}");
+        let (mut work_items, mut gpu_output) = (
+            work_items
+                .entry(entity)
+                .or_insert_with(|| BufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE)),
+            gpu_output
+                .entry(entity)
+                .or_insert_with(|| UninitBufferVec::new(BufferUsages::STORAGE)),
+        );
 
         work_items.clear();
         gpu_output.clear();
 
-        for led in leds.drain(..) {
+        for (_, led ) in leds.work_items.drain() {
             let mut offset_index = gpu_output.len();
             for _ in 0..led.num_leds {
                 offset_index += gpu_output.add();
@@ -297,16 +328,22 @@ fn prepare_buffers(
 }
 
 fn prepare_bind_groups(
-    views: Query<(Entity, &ExtractedView, &ScreenTexture)>,
+    mut commands: Commands,
+    views: Query<(Entity, &ScreenTexture, &ViewLeds), With<ExtractedView>>,
     view_uniforms: Res<ViewUniforms>,
     gpu_images: Res<RenderAssets<GpuImage>>,
-    pipeline: Res<ComputePipeline>,
+    compute_pipeline: Res<ComputePipeline>,
+    material_pipeline: Res<LedMaterialPipeline>,
     render_device: Res<RenderDevice>,
-    work_items: Res<WorkItemBuffers>,
-    gpu_output: Res<GpuOutputBuffers>,
-    mut bind_groups: ResMut<ComputeBindGroups>,
+    render_queue: Res<RenderQueue>,
+    fallback_img: Res<FallbackImage>,
+    mut work_items: ResMut<WorkItemBuffers>,
+    mut gpu_output: ResMut<GpuOutputBuffers>,
+    mut compute_bind_groups: ResMut<ComputeBindGroups>,
 ) {
-    for (entity, view, screen_texture) in &views {
+    for (entity, screen_texture, view_leds) in &views {
+        info!("Preparing bind groups for entity {entity:?}");
+
         let screen_texture = gpu_images
             .get(&screen_texture.0)
             .expect("image should exist");
@@ -314,21 +351,29 @@ fn prepare_bind_groups(
         let Some(view_uniforms_binding) = view_uniforms.uniforms.binding() else {
             continue;
         };
+        let Some(mut gpu_output) = gpu_output.get_mut(&entity) else {
+            continue;
+        };
+        let Some(work_items) = work_items.get_mut(&entity) else {
+            continue;
+        };
+        if gpu_output.is_empty() || work_items.is_empty() {
+            continue;
+        }
+
+        gpu_output.write_buffer(&render_device);
+        work_items.write_buffer(&render_device, &render_queue);
 
         let bind_group = render_device.create_bind_group(
-            None,
-            &pipeline.layout,
+            Some("compute_bind_group"),
+            &compute_pipeline.layout,
             &BindGroupEntries::sequential((
                 screen_texture.texture_view.into_binding(),
                 gpu_output
-                    .get(&entity)
-                    .expect("buffer should exist")
                     .buffer()
                     .expect("buffer should exist")
                     .as_entire_binding(),
                 work_items
-                    .get(&entity)
-                    .expect("buffer should exist")
                     .buffer()
                     .expect("buffer should exist")
                     .as_entire_binding(),
@@ -336,7 +381,17 @@ fn prepare_bind_groups(
             )),
         );
 
-        bind_groups.insert(entity, bind_group);
+        compute_bind_groups.insert(entity, bind_group);
+
+        for (entity, material) in view_leds.materials.iter() {
+            let bind_group = material.as_bind_group(
+                &material_pipeline.layout,
+                &render_device,
+                &gpu_images,
+                &fallback_img,
+            ).expect("Failed to create bind group");
+            commands.entity(*entity).insert(LedMaterialBindGroup(bind_group.bind_group.clone()));
+        }
     }
 }
 
@@ -346,7 +401,7 @@ struct ComputePipeline {
     pipeline: CachedComputePipelineId,
 }
 
-#[derive(Component, ShaderType, Clone)]
+#[derive(Component, ShaderType, Clone, Debug)]
 pub struct LedWorkItem {
     start_index: u32,
     num_leds: u32,
@@ -366,7 +421,7 @@ impl FromWorld for ComputePipeline {
                     texture_2d(TextureSampleType::Float { filterable: true }),
                     storage_buffer::<LinearRgba>(false),
                     storage_buffer_read_only::<LedWorkItem>(false),
-                    uniform_buffer::<ViewUniform>(true)
+                    uniform_buffer::<ViewUniform>(true),
                 ),
             ),
         );
@@ -481,5 +536,86 @@ impl ViewNode for ComputeNode {
         );
 
         Ok(())
+    }
+}
+
+#[derive(Resource)]
+struct LedMaterialPipeline {
+    mesh_pipeline: MeshPipeline,
+    layout: BindGroupLayout,
+}
+
+impl FromWorld for LedMaterialPipeline {
+    fn from_world(world: &mut World) -> Self {
+        let mesh_pipeline = world.resource::<MeshPipeline>();
+        let render_device = world.resource::<RenderDevice>();
+        LedMaterialPipeline {
+            mesh_pipeline: mesh_pipeline.clone(),
+            layout: LedMaterial::bind_group_layout(render_device),
+        }
+    }
+}
+
+impl SpecializedMeshPipeline for LedMaterialPipeline {
+    type Key = MeshPipelineKey;
+
+    fn specialize(
+        &self,
+        key: Self::Key,
+        layout: &MeshVertexBufferLayoutRef,
+    ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
+        let mut descriptor = self.mesh_pipeline.specialize(key, layout)?;
+        descriptor.vertex.shader = MATERIAL_SHADER_HANDLE.clone();
+        descriptor.layout.push(self.layout.clone());
+        descriptor.fragment.as_mut().unwrap().shader = MATERIAL_SHADER_HANDLE.clone();
+        Ok(descriptor)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_led_material(
+    transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
+    custom_pipeline: Res<LedMaterialPipeline>,
+    msaa: Res<Msaa>,
+    mut pipelines: ResMut<SpecializedMeshPipelines<LedMaterialPipeline>>,
+    pipeline_cache: Res<PipelineCache>,
+    meshes: Res<RenderAssets<GpuMesh>>,
+    render_mesh_instances: Res<RenderMeshInstances>,
+    material_meshes: Query<Entity, With<LedZone>>,
+    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
+    mut views: Query<(Entity, &ExtractedView), Without<ScreenTextureCamera>>,
+) {
+    let draw_custom = transparent_3d_draw_functions.read().id::<DrawLedMaterial>();
+
+    let msaa_key = MeshPipelineKey::from_msaa_samples(msaa.samples());
+
+    for (view_entity, view) in &mut views {
+        let Some(transparent_phase) = transparent_render_phases.get_mut(&view_entity) else {
+            continue;
+        };
+
+        let view_key = msaa_key | MeshPipelineKey::from_hdr(view.hdr);
+        let rangefinder = view.rangefinder3d();
+        for entity in &material_meshes {
+            let Some(mesh_instance) = render_mesh_instances.render_mesh_queue_data(entity) else {
+                continue;
+            };
+            let Some(mesh) = meshes.get(mesh_instance.mesh_asset_id) else {
+                continue;
+            };
+            let key =
+                view_key | MeshPipelineKey::from_primitive_topology(mesh.primitive_topology());
+            let pipeline = pipelines
+                .specialize(&pipeline_cache, &custom_pipeline, key, &mesh.layout)
+                .unwrap();
+            transparent_phase.add(Transparent3d {
+                entity,
+                pipeline,
+                draw_function: draw_custom,
+                distance: rangefinder.distance_translation(&mesh_instance.translation),
+                batch_range: 0..1,
+                extra_index: PhaseItemExtraIndex::NONE,
+            });
+        }
     }
 }
