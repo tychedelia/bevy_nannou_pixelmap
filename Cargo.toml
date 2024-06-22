@@ -4,10 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = { path = "../../bevyengine/bevy" }
+bevy = "0.14.0-rc.3"
 crossbeam-channel = "0.5.13"
 socket2 =  {  version = "0.5.7", features = ["all"] }
 artnet_protocol = "0.4.2"
+bytemuck = "1"
 
 [[example]]
 name = "test"

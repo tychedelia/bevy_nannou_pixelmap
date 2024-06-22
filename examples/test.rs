@@ -15,8 +15,8 @@ fn main() {
                     commands.spawn((
                         LedZone {
                             count: 100,
-                            position: Vec2::new(150.0, 250.0),
-                            size: Vec2::new(512.0,100.0),
+                            position: Vec2::new(150.0, 300.0) * 2.0,
+                            size: Vec2::new(512.0,100.0) * 2.0,
                         },
                         meshes.add(Plane3d::new(Vec3::Y, Vec2::new(10.0, 10.0))),
                         SpatialBundle {
