@@ -44,14 +44,8 @@ mod artnet;
 mod compute;
 mod material;
 
-#[derive(Resource, Deref)]
-struct MainWorldReceiver(Receiver<Vec<u32>>);
-#[derive(Resource, Deref)]
-struct RenderWorldSender(Sender<Vec<u32>>);
-
 pub struct NannouArtnetPlugin;
 
-const BUFFER_SIZE: usize = 256 * 4;
 const COMPUTE_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(966169125558327);
 const MATERIAL_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(116169934631328);
 
@@ -81,12 +75,8 @@ impl Plugin for NannouArtnetPlugin {
     }
 
     fn finish(&self, app: &mut App) {
-        let (s, r) = crossbeam_channel::unbounded();
-        app.insert_resource(MainWorldReceiver(r));
-
         let render_app = app.sub_app_mut(RenderApp);
         render_app
-            .insert_resource(RenderWorldSender(s))
             .init_resource::<ComputePipeline>()
             .init_resource::<WorkItemBuffers>()
             .init_resource::<GpuOutputBuffers>()
@@ -108,7 +98,7 @@ impl Plugin for NannouArtnetPlugin {
             .add_render_graph_node::<ViewNodeRunner<ComputeNode>>(Core3d, ComputeNodeLabel)
             .add_render_graph_edges(
                 Core3d,
-                (Node3d::StartMainPass, ComputeNodeLabel, Node3d::EndMainPass),
+                (Node3d::StartMainPass, ComputeNodeLabel, Node3d::MainOpaquePass),
             );
     }
 }
@@ -139,7 +129,6 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMaterialBindGroup<I> 
             return RenderCommandResult::Failure;
         };
 
-        info!("Setting bind group for entity {view_entity:?}");
         pass.set_bind_group(I, &bind_group.0, &[]);
         RenderCommandResult::Success
     }
@@ -147,12 +136,12 @@ impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMaterialBindGroup<I> 
 
 fn spawn_screen_textures(
     mut commands: Commands,
-    camera_q: Query<(Entity, &Camera), (Without<ScreenTexture>, Without<ScreenTextureCamera>)>,
+    camera_q: Query<(Entity, &Camera, &Transform), (Without<ScreenTexture>, Without<ScreenTextureCamera>)>,
     mut images: ResMut<Assets<Image>>,
     windows_q: Query<&Window>,
     primary_window_q: Query<&Window, With<PrimaryWindow>>,
 ) {
-    for (entity, cam) in camera_q.iter() {
+    for (entity, cam, cam_transform) in camera_q.iter() {
         let RenderTarget::Window(window_target) = cam.target else {
             panic!("Camera target should be a window");
         };
@@ -191,6 +180,7 @@ fn spawn_screen_textures(
 
         let screen_texture_camera = commands.spawn((
             Camera3dBundle {
+                transform: cam_transform.clone(),
                 camera: Camera {
                     order: cam.order - 1, // always render before the camera
                     target: RenderTarget::Image(image.clone()),
@@ -202,12 +192,6 @@ fn spawn_screen_textures(
         )).id();
 
         commands.entity(entity).insert((ScreenTexture(image), ScreenTextureCameraRef(screen_texture_camera)));
-    }
-}
-
-fn receive(receiver: Res<MainWorldReceiver>) {
-    if let Ok(data) = receiver.try_recv() {
-        println!("Received data from render world: {data:?}");
     }
 }
 
@@ -265,14 +249,14 @@ fn queue_leds(
     leds: Query<&LedZone>,
 ) {
     for (view_entity, view, visible_entities) in views.iter() {
-        info!("Extracting leds for entity {view_entity:?}");
         let mut view_leds = ViewLeds::default();
-        for (idx, visible ) in visible_entities.iter::<WithMesh>().enumerate() {
+        for visible in visible_entities.iter::<WithMesh>() {
+            let mut idx = 0;
             if let Ok(led) = leds.get(*visible) {
                 view_leds.work_items.insert(*visible, LedWorkItem {
                     start_index: 0,
                     num_leds: led.count,
-                    num_samples: 1,
+                    num_samples: 100,
                     total_area_size: led.size,
                     area_position: led.position,
                 });
@@ -289,9 +273,10 @@ fn queue_leds(
                     count: led.count,
                     color_buffer: buffer.clone(),
                 });
+
+                idx += 1;
             }
         }
-        info!("Inserting leds for entity {view_entity:?}: {view_leds:?} leds");
         commands.entity(view_entity).insert(view_leds);
     }
 }
@@ -303,18 +288,21 @@ fn prepare_buffers(
     mut views: Query<(Entity, &mut ViewLeds), With<ExtractedView>>,
 ) {
     for (entity, mut leds) in &mut views {
-        info!("Preparing buffers for entity {entity:?}");
-        let (mut work_items, mut gpu_output) = (
+        let (mut work_items, mut gpu_output, cpu_readback) = (
             work_items
                 .entry(entity)
                 .or_insert_with(|| BufferVec::new(BufferUsages::COPY_DST | BufferUsages::STORAGE)),
             gpu_output
                 .entry(entity)
                 .or_insert_with(|| UninitBufferVec::new(BufferUsages::STORAGE)),
+            cpu_readback
+                .entry(entity)
+                .or_insert_with(|| RawBufferVec::new(BufferUsages::COPY_SRC)),
         );
 
         work_items.clear();
         gpu_output.clear();
+        cpu_readback.clear();
 
         for (_, led ) in leds.work_items.drain() {
             let mut offset_index = gpu_output.len();
@@ -342,8 +330,6 @@ fn prepare_bind_groups(
     mut compute_bind_groups: ResMut<ComputeBindGroups>,
 ) {
     for (entity, screen_texture, view_leds) in &views {
-        info!("Preparing bind groups for entity {entity:?}");
-
         let screen_texture = gpu_images
             .get(&screen_texture.0)
             .expect("image should exist");
@@ -438,7 +424,7 @@ impl FromWorld for ComputePipeline {
     }
 }
 
-fn map_and_read_buffer(render_device: Res<RenderDevice>, sender: Res<RenderWorldSender>) {
+fn map_and_read_buffer(render_device: Res<RenderDevice>) {
     // let buffer_slice = buffers
     //     .cpu_buffers
     //     .buffer()
@@ -508,6 +494,9 @@ impl ViewNode for ComputeNode {
         let Some(cpu_buffer) = cpu_readback.get(&view_entity) else {
             return Ok(());
         };
+        let Some(bind_group) = bind_groups.get(&view_entity) else {
+            return Ok(());
+        };
 
         if let Some(init_pipeline) = pipeline_cache.get_compute_pipeline(pipeline.pipeline) {
             let mut pass =
@@ -520,20 +509,20 @@ impl ViewNode for ComputeNode {
 
             pass.set_bind_group(
                 0,
-                bind_groups.get(&view_entity).as_ref().unwrap().clone(),
+                bind_group,
                 &[view_uniform.offset],
             );
             pass.set_pipeline(init_pipeline);
             pass.dispatch_workgroups(work_items.capacity() as u32, 1, 1);
         }
 
-        render_context.command_encoder().copy_buffer_to_buffer(
-            &gpu_buffer.buffer().expect("buffer should exist"),
-            0,
-            &cpu_buffer.buffer().expect("buffer should exist"),
-            0,
-            (gpu_buffer.len() * std::mem::size_of::<LinearRgba>()) as u64,
-        );
+        // render_context.command_encoder().copy_buffer_to_buffer(
+        //     &gpu_buffer.buffer().expect("buffer should exist"),
+        //     0,
+        //     &cpu_buffer.buffer().expect("buffer should exist"),
+        //     0,
+        //     (gpu_buffer.len() * size_of::<LinearRgba>()) as u64,
+        // );
 
         Ok(())
     }
@@ -565,7 +554,7 @@ impl SpecializedMeshPipeline for LedMaterialPipeline {
         layout: &MeshVertexBufferLayoutRef,
     ) -> Result<RenderPipelineDescriptor, SpecializedMeshPipelineError> {
         let mut descriptor = self.mesh_pipeline.specialize(key, layout)?;
-        descriptor.vertex.shader = MATERIAL_SHADER_HANDLE.clone();
+        // descriptor.vertex.shader = MATERIAL_SHADER_HANDLE.clone();
         descriptor.layout.push(self.layout.clone());
         descriptor.fragment.as_mut().unwrap().shader = MATERIAL_SHADER_HANDLE.clone();
         Ok(descriptor)

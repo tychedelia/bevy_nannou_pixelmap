@@ -49,7 +49,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
 
         let avg_color = color_sum / f32(sample_count);
-
         average_colors[led_data.start_index + led_index] = avg_color;
     }
 }
