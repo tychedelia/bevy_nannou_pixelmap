@@ -1,3 +1,5 @@
+use crate::artnet::{ArtNetPlugin, ArtNetServer};
+use artnet_protocol::{ArtCommand, Output, PortAddress};
 use bevy::asset::load_internal_asset;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy::core_pipeline::core_3d::{Transparent3d, CORE_3D_DEPTH_FORMAT};
@@ -47,14 +49,14 @@ use bevy::{
         Render, RenderApp, RenderSet,
     },
 };
+use bevy_mod_picking::DefaultPickingPlugins;
 use crossbeam_channel::{Receiver, Sender};
 use std::borrow::Cow;
-use artnet_protocol::{ArtCommand, Output, PortAddress};
-use crate::artnet::{ArtNetPlugin, ArtNetServer};
 
 mod artnet;
 mod compute;
 mod material;
+mod sacn;
 
 pub struct NannouArtnetPlugin;
 
@@ -78,6 +80,7 @@ impl Plugin for NannouArtnetPlugin {
 
         app.add_plugins((
             ArtNetPlugin,
+            DefaultPickingPlugins,
             ExtractComponentPlugin::<LedZone>::default(),
             ExtractComponentPlugin::<ScreenTexture>::default(),
             ExtractComponentPlugin::<ScreenTextureCamera>::default(),
@@ -180,7 +183,11 @@ fn spawn_screen_textures(
     mut commands: Commands,
     camera_q: Query<
         (Entity, &Camera, &Transform),
-        (Without<ScreenTexture>, Without<ScreenTextureCamera>),
+        (
+            With<Camera3d>,
+            Without<ScreenTexture>,
+            Without<ScreenTextureCamera>,
+        ),
     >,
     mut images: ResMut<Assets<Image>>,
     windows_q: Query<&Window>,
@@ -270,6 +277,7 @@ struct ComputeBindGroups(EntityHashMap<BindGroup>);
 #[derive(Component, ExtractComponent, Clone)]
 pub struct LedZone {
     pub count: u32,
+    pub rotation: f32,
     pub position: Vec2,
     pub size: Vec2,
 }
@@ -278,6 +286,8 @@ pub struct LedZone {
 pub struct LedMaterial {
     #[uniform(0)]
     pub offset: u32,
+    #[uniform(0)]
+    pub rotation: f32,
     #[uniform(0)]
     pub count: u32,
     #[uniform(0)]
@@ -312,8 +322,9 @@ fn queue_leds(
                     *visible,
                     LedWorkItem {
                         start_index: 0,
+                        rotation: led.rotation,
                         num_leds: led.count,
-                        num_samples: 100,
+                        num_samples: 10,
                         total_area_size: led.size,
                         area_position: led.position,
                     },
@@ -330,6 +341,7 @@ fn queue_leds(
                     *visible,
                     LedMaterial {
                         offset: idx as u32,
+                        rotation: led.rotation,
                         count: led.count,
                         position: led.position,
                         size: led.size,
@@ -462,6 +474,7 @@ struct ComputePipeline {
 #[derive(Component, ShaderType, Clone, Debug)]
 pub struct LedWorkItem {
     start_index: u32,
+    rotation: f32,
     num_leds: u32,
     num_samples: u32,
     total_area_size: Vec2,
@@ -507,14 +520,14 @@ fn f32_vec_to_u8_vec(values: Vec<f32>) -> Vec<u8> {
     values.iter().map(|&v| f32_to_u8(v)).collect()
 }
 
-
 fn receive(receiver: Res<MainWorldReceiver>, artnet_server: ResMut<ArtNetServer>) {
     if let Ok(data) = receiver.try_recv() {
-        info!("Received data from main world");
-        artnet_server.send(ArtCommand::Output(Output {
-            data: f32_vec_to_u8_vec(data).into(),
-            ..default()
-        }))
+        // info!("data received: {data:?}");
+
+        // artnet_server.send(ArtCommand::Output(Output {
+        //     data: f32_vec_to_u8_vec(data).into(),
+        //     ..default()
+        // }))
     }
 }
 fn map_and_read_buffer(
@@ -543,16 +556,13 @@ fn map_and_read_buffer(
 
         r.recv().expect("Failed to receive the map_async message");
 
-        info!("Reading buffer data for entity {entity}");
         {
             let buffer_view = buffer_slice.get_mapped_range();
             let data = buffer_view
                 .chunks(size_of::<f32>())
                 .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("should be a u32")))
                 .collect::<Vec<f32>>();
-            sender
-                .send(data)
-                .expect("Failed to send data to main world");
+            let _ = sender.send(data);
         }
         buffer.unmap();
     }
@@ -632,8 +642,6 @@ impl FromWorld for LedMaterialPipeline {
         let render_device = world.resource::<RenderDevice>();
         let mut layout_entries = LedMaterial::bind_group_layout_entries(render_device);
         layout_entries[0].visibility = ShaderStages::VERTEX | ShaderStages::FRAGMENT;
-        info!("Creating bind group layout for led material");
-        info!("{:?}", layout_entries);
         let layout = render_device.create_bind_group_layout(LedMaterial::label(), &layout_entries);
         LedMaterialPipeline {
             mesh_pipeline: mesh_pipeline.clone(),
