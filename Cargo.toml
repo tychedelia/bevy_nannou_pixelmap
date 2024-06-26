@@ -7,13 +7,12 @@ edition = "2021"
 bevy = "0.14.0-rc.3"
 crossbeam-channel = "0.5.13"
 socket2 = { version = "0.5.7", features = ["all"] }
-artnet_protocol = "0.4.2"
 bytemuck = "1"
 bevy_mod_picking = { version = "0.20.0-rc.0", default-features = false, features = [
     "backend_raycast",
     "selection",
 ] }
-sacn = "0.4.4"
+sacn = { git = "https://github.com/tychedelia/sacn", branch = "main" }
 
 [[example]]
 name = "test"

@@ -1,8 +1,17 @@
-use crate::artnet::{ArtNetPlugin, ArtNetServer};
-use artnet_protocol::{ArtCommand, Output, PortAddress};
+use std::borrow::Cow;
+
+use bevy::{
+    prelude::*,
+    render::{
+        Render,
+        render_graph::{self, RenderGraph, RenderLabel},
+        render_resource::{*, binding_types::storage_buffer},
+        RenderApp, renderer::{RenderContext, RenderDevice}, RenderSet,
+    },
+};
 use bevy::asset::load_internal_asset;
+use bevy::core_pipeline::core_3d::{CORE_3D_DEPTH_FORMAT, Transparent3d};
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
-use bevy::core_pipeline::core_3d::{Transparent3d, CORE_3D_DEPTH_FORMAT};
 use bevy::core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
 use bevy::ecs::entity::EntityHashMap;
 use bevy::ecs::query::{QueryItem, ROQueryItem};
@@ -15,11 +24,11 @@ use bevy::pbr::{
     ViewLightsUniformOffset, ViewScreenSpaceReflectionsUniformOffset,
 };
 use bevy::render::camera::RenderTarget;
+use bevy::render::Extract;
 use bevy::render::extract_component::{
     ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
     UniformComponentPlugin,
 };
-use bevy::render::extract_instances::ExtractInstancesPlugin;
 use bevy::render::mesh::{GpuMesh, MeshVertexBufferLayoutRef};
 use bevy::render::render_asset::{RenderAssetPlugin, RenderAssets};
 use bevy::render::render_graph::{
@@ -34,36 +43,25 @@ use bevy::render::render_resource::binding_types::{
 };
 use bevy::render::renderer::RenderQueue;
 use bevy::render::texture::{BevyDefault, FallbackImage, GpuImage};
-use bevy::render::view::{
-    check_visibility, ExtractedView, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms,
-    VisibleEntities, WithMesh,
-};
-use bevy::render::Extract;
+use bevy::render::view::{check_visibility, ExtractedView, NoFrustumCulling, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms, VisibleEntities, WithMesh};
 use bevy::window::{PrimaryWindow, WindowClosing, WindowRef};
-use bevy::{
-    prelude::*,
-    render::{
-        render_graph::{self, RenderGraph, RenderLabel},
-        render_resource::{binding_types::storage_buffer, *},
-        renderer::{RenderContext, RenderDevice},
-        Render, RenderApp, RenderSet,
-    },
-};
 use bevy_mod_picking::DefaultPickingPlugins;
 use crossbeam_channel::{Receiver, Sender};
-use std::borrow::Cow;
+pub use sacn;
 
-mod artnet;
+use crate::ui::UiPlugin;
+
 mod compute;
 mod material;
-mod sacn;
+mod sacn_src;
+mod ui;
 
-pub struct NannouArtnetPlugin;
+pub struct NannouPixelmapPlugin;
 
 const COMPUTE_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(966169125558327);
 const MATERIAL_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(116169934631328);
 
-impl Plugin for NannouArtnetPlugin {
+impl Plugin for NannouPixelmapPlugin {
     fn build(&self, app: &mut App) {
         load_internal_asset!(
             app,
@@ -79,20 +77,19 @@ impl Plugin for NannouArtnetPlugin {
         );
 
         app.add_plugins((
-            ArtNetPlugin,
+            UiPlugin,
             DefaultPickingPlugins,
             ExtractComponentPlugin::<LedZone>::default(),
             ExtractComponentPlugin::<ScreenTexture>::default(),
             ExtractComponentPlugin::<ScreenTextureCamera>::default(),
         ))
-        .add_systems(Update, receive)
         .add_systems(PostUpdate, check_visibility::<With<LedZone>>)
         .add_systems(First, spawn_screen_textures);
     }
 
     fn finish(&self, app: &mut App) {
         let (s, r) = crossbeam_channel::unbounded();
-        app.insert_resource(MainWorldReceiver(r));
+        app.insert_resource(LedDataReceiver(r));
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -127,9 +124,9 @@ impl Plugin for NannouArtnetPlugin {
     }
 }
 #[derive(Resource, Deref)]
-struct MainWorldReceiver(Receiver<Vec<f32>>);
+pub struct LedDataReceiver(Receiver<(Entity, Vec<f32>)>);
 #[derive(Resource, Deref)]
-struct RenderWorldSender(Sender<Vec<f32>>);
+struct RenderWorldSender(Sender<(Entity, Vec<f32>)>);
 
 type DrawLedMaterial = (
     SetItemPipeline,
@@ -274,12 +271,41 @@ pub struct ScreenTexture(pub Handle<Image>);
 #[derive(Resource, Deref, DerefMut, Default)]
 struct ComputeBindGroups(EntityHashMap<BindGroup>);
 
+#[derive(Bundle, Default)]
+pub struct LedBundle {
+    /// The led's zone.
+    pub zone: LedZone,
+    /// The visibility of the entity.
+    pub visibility: Visibility,
+    /// The inherited visibility of the entity.
+    pub inherited_visibility: InheritedVisibility,
+    /// The view visibility of the entity.
+    pub view_visibility: ViewVisibility,
+    /// The transform of the entity.
+    pub transform: Transform,
+    /// The global transform of the entity.
+    pub global_transform: GlobalTransform,
+    /// No frustum culling.
+    pub no_frustum_culling: NoFrustumCulling,
+}
+
 #[derive(Component, ExtractComponent, Clone)]
 pub struct LedZone {
     pub count: u32,
     pub rotation: f32,
     pub position: Vec2,
     pub size: Vec2,
+}
+
+impl Default for LedZone {
+    fn default() -> Self {
+        LedZone {
+            count: 1,
+            rotation: 0.0,
+            position: Vec2::ZERO,
+            size: Vec2::ONE,
+        }
+    }
 }
 
 #[derive(AsBindGroup, Debug, Clone)]
@@ -520,23 +546,13 @@ fn f32_vec_to_u8_vec(values: Vec<f32>) -> Vec<u8> {
     values.iter().map(|&v| f32_to_u8(v)).collect()
 }
 
-fn receive(receiver: Res<MainWorldReceiver>, artnet_server: ResMut<ArtNetServer>) {
-    if let Ok(data) = receiver.try_recv() {
-        // info!("data received: {data:?}");
-
-        // artnet_server.send(ArtCommand::Output(Output {
-        //     data: f32_vec_to_u8_vec(data).into(),
-        //     ..default()
-        // }))
-    }
-}
 fn map_and_read_buffer(
     render_device: Res<RenderDevice>,
     cpu_readback_buffers: Res<CpuReadbackBuffers>,
     sender: ResMut<RenderWorldSender>,
-    views_q: Query<(Entity), (With<ScreenTexture>, With<ExtractedView>)>,
+    views_q: Query<(Entity, &ViewLeds), (With<ScreenTexture>, With<ExtractedView>)>,
 ) {
-    for entity in views_q.iter() {
+    for (entity , view_leds) in views_q.iter() {
         let Some(buffer) = cpu_readback_buffers.get(&entity) else {
             continue;
         };
@@ -562,7 +578,11 @@ fn map_and_read_buffer(
                 .chunks(size_of::<f32>())
                 .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("should be a u32")))
                 .collect::<Vec<f32>>();
-            let _ = sender.send(data);
+
+            for (led_entity, led) in view_leds.materials.iter() {
+                let led_data = data[led.offset as usize..(led.offset + led.count) as usize].to_vec();
+                sender.send((*led_entity, led_data)).expect("Failed to send led data");
+            }
         }
         buffer.unmap();
     }
