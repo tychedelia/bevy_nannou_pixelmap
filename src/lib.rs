@@ -1,17 +1,8 @@
 use std::borrow::Cow;
 
-use bevy::{
-    prelude::*,
-    render::{
-        Render,
-        render_graph::{self, RenderGraph, RenderLabel},
-        render_resource::{*, binding_types::storage_buffer},
-        RenderApp, renderer::{RenderContext, RenderDevice}, RenderSet,
-    },
-};
 use bevy::asset::load_internal_asset;
-use bevy::core_pipeline::core_3d::{CORE_3D_DEPTH_FORMAT, Transparent3d};
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
+use bevy::core_pipeline::core_3d::{Transparent3d, CORE_3D_DEPTH_FORMAT};
 use bevy::core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
 use bevy::ecs::entity::EntityHashMap;
 use bevy::ecs::query::{QueryItem, ROQueryItem};
@@ -24,7 +15,6 @@ use bevy::pbr::{
     ViewLightsUniformOffset, ViewScreenSpaceReflectionsUniformOffset,
 };
 use bevy::render::camera::RenderTarget;
-use bevy::render::Extract;
 use bevy::render::extract_component::{
     ComponentUniforms, DynamicUniformIndex, ExtractComponent, ExtractComponentPlugin,
     UniformComponentPlugin,
@@ -43,23 +33,34 @@ use bevy::render::render_resource::binding_types::{
 };
 use bevy::render::renderer::RenderQueue;
 use bevy::render::texture::{BevyDefault, FallbackImage, GpuImage};
-use bevy::render::view::{check_visibility, ExtractedView, NoFrustumCulling, ViewTarget, ViewUniform, ViewUniformOffset, ViewUniforms, VisibleEntities, WithMesh};
+use bevy::render::view::{
+    check_visibility, ExtractedView, NoFrustumCulling, ViewTarget, ViewUniform, ViewUniformOffset,
+    ViewUniforms, VisibleEntities, WithMesh,
+};
+use bevy::render::Extract;
 use bevy::window::{PrimaryWindow, WindowClosing, WindowRef};
+use bevy::{
+    prelude::*,
+    render::{
+        render_graph::{self, RenderGraph, RenderLabel},
+        render_resource::{binding_types::storage_buffer, *},
+        renderer::{RenderContext, RenderDevice},
+        Render, RenderApp, RenderSet,
+    },
+};
 use bevy_mod_picking::DefaultPickingPlugins;
 use crossbeam_channel::{Receiver, Sender};
 pub use sacn;
 
 use crate::ui::UiPlugin;
 
-mod compute;
-mod material;
 mod sacn_src;
 mod ui;
 
-pub struct NannouPixelmapPlugin;
-
 const COMPUTE_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(966169125558327);
 const MATERIAL_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(116169934631328);
+
+pub struct NannouPixelmapPlugin;
 
 impl Plugin for NannouPixelmapPlugin {
     fn build(&self, app: &mut App) {
@@ -127,128 +128,6 @@ impl Plugin for NannouPixelmapPlugin {
 pub struct LedDataReceiver(Receiver<(Entity, Vec<f32>)>);
 #[derive(Resource, Deref)]
 struct RenderWorldSender(Sender<(Entity, Vec<f32>)>);
-
-type DrawLedMaterial = (
-    SetItemPipeline,
-    SetMeshViewBindGroup<0>,
-    SetMaterialBindGroup<1>,
-    DrawMaterial,
-);
-
-pub struct SetMaterialBindGroup<const I: usize>;
-impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMaterialBindGroup<I> {
-    type Param = ();
-    type ViewQuery = (Entity);
-    type ItemQuery = (Read<LedMaterialBindGroup>);
-
-    #[inline]
-    fn render<'w>(
-        _item: &P,
-        (view_entity): ROQueryItem<'w, Self::ViewQuery>,
-        (bind_group): Option<ROQueryItem<'w, Self::ItemQuery>>,
-        _: SystemParamItem<'w, '_, Self::Param>,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        let Some(bind_group) = bind_group else {
-            return RenderCommandResult::Failure;
-        };
-
-        pass.set_bind_group(I, &bind_group.0, &[]);
-        RenderCommandResult::Success
-    }
-}
-
-pub struct DrawMaterial;
-impl<P: PhaseItem> RenderCommand<P> for DrawMaterial {
-    type Param = ();
-    type ViewQuery = ();
-    type ItemQuery = ();
-
-    fn render<'w>(
-        _item: &P,
-        _view: ROQueryItem<'w, Self::ViewQuery>,
-        _entity: Option<ROQueryItem<'w, Self::ItemQuery>>,
-        _param: SystemParamItem<'w, '_, Self::Param>,
-        pass: &mut TrackedRenderPass<'w>,
-    ) -> RenderCommandResult {
-        pass.draw(0..4, 0..1);
-        RenderCommandResult::Success
-    }
-}
-
-fn spawn_screen_textures(
-    mut commands: Commands,
-    camera_q: Query<
-        (Entity, &Camera, &Transform),
-        (
-            With<Camera3d>,
-            Without<ScreenTexture>,
-            Without<ScreenTextureCamera>,
-        ),
-    >,
-    mut images: ResMut<Assets<Image>>,
-    windows_q: Query<&Window>,
-    primary_window_q: Query<&Window, With<PrimaryWindow>>,
-) {
-    for (entity, cam, cam_transform) in camera_q.iter() {
-        let RenderTarget::Window(window_target) = cam.target else {
-            panic!("Camera target should be a window");
-        };
-        let window = match window_target {
-            WindowRef::Primary => primary_window_q.single(),
-            WindowRef::Entity(window) => windows_q.get(window).unwrap(),
-        };
-
-        let size = Extent3d {
-            width: (window.physical_width() as f32 * window.scale_factor()) as u32,
-            height: (window.physical_height() as f32 * window.scale_factor()) as u32,
-            ..default()
-        };
-        let mut image = Image {
-            texture_descriptor: TextureDescriptor {
-                label: None,
-                size,
-                dimension: TextureDimension::D2,
-                format: if cam.hdr {
-                    ViewTarget::TEXTURE_FORMAT_HDR
-                } else {
-                    TextureFormat::bevy_default()
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                usage: TextureUsages::TEXTURE_BINDING
-                    | TextureUsages::COPY_DST
-                    | TextureUsages::RENDER_ATTACHMENT,
-                view_formats: &[],
-            },
-            ..default()
-        };
-
-        image.resize(size);
-        let image = images.add(image);
-
-        let screen_texture_camera = commands
-            .spawn((
-                Camera3dBundle {
-                    transform: cam_transform.clone(),
-                    camera: Camera {
-                        order: cam.order - 1, // always render before the camera
-                        target: RenderTarget::Image(image.clone()),
-                        ..default()
-                    },
-                    ..default()
-                },
-                ScreenTextureCamera,
-            ))
-            .id();
-
-        info!("Spawning screen texture camera {screen_texture_camera} for camera {entity}");
-        commands.entity(entity).insert((
-            ScreenTexture(image),
-            ScreenTextureCameraRef(screen_texture_camera),
-        ));
-    }
-}
 
 #[derive(Resource, Deref, DerefMut, Default)]
 struct WorkItemBuffers(EntityHashMap<BufferVec<LedWorkItem>>);
@@ -333,6 +212,83 @@ pub struct ViewLeds {
     materials: EntityHashMap<LedMaterial>,
 }
 
+// -------------------------
+// Systems
+// -------------------------
+
+fn spawn_screen_textures(
+    mut commands: Commands,
+    camera_q: Query<
+        (Entity, &Camera, &Transform),
+        (
+            With<Camera3d>,
+            Without<ScreenTexture>,
+            Without<ScreenTextureCamera>,
+        ),
+    >,
+    mut images: ResMut<Assets<Image>>,
+    windows_q: Query<&Window>,
+    primary_window_q: Query<&Window, With<PrimaryWindow>>,
+) {
+    for (entity, cam, cam_transform) in camera_q.iter() {
+        let RenderTarget::Window(window_target) = cam.target else {
+            panic!("Camera target should be a window");
+        };
+        let window = match window_target {
+            WindowRef::Primary => primary_window_q.single(),
+            WindowRef::Entity(window) => windows_q.get(window).unwrap(),
+        };
+
+        let size = Extent3d {
+            width: (window.physical_width() as f32 * window.scale_factor()) as u32,
+            height: (window.physical_height() as f32 * window.scale_factor()) as u32,
+            ..default()
+        };
+        let mut image = Image {
+            texture_descriptor: TextureDescriptor {
+                label: None,
+                size,
+                dimension: TextureDimension::D2,
+                format: if cam.hdr {
+                    ViewTarget::TEXTURE_FORMAT_HDR
+                } else {
+                    TextureFormat::bevy_default()
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                usage: TextureUsages::TEXTURE_BINDING
+                    | TextureUsages::COPY_DST
+                    | TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            },
+            ..default()
+        };
+
+        image.resize(size);
+        let image = images.add(image);
+
+        let screen_texture_camera = commands
+            .spawn((
+                Camera3dBundle {
+                    transform: cam_transform.clone(),
+                    camera: Camera {
+                        order: cam.order - 1, // always render before the camera
+                        target: RenderTarget::Image(image.clone()),
+                        ..default()
+                    },
+                    ..default()
+                },
+                ScreenTextureCamera,
+            ))
+            .id();
+
+        info!("Spawning screen texture camera {screen_texture_camera} for camera {entity}");
+        commands.entity(entity).insert((
+            ScreenTexture(image),
+            ScreenTextureCameraRef(screen_texture_camera),
+        ));
+    }
+}
 fn queue_leds(
     mut commands: Commands,
     views: Query<(Entity, &ExtractedView, &VisibleEntities), Without<ScreenTextureCamera>>,
@@ -490,6 +446,65 @@ fn prepare_bind_groups(
         }
     }
 }
+fn f32_to_u8(value: f32) -> u8 {
+    // Clamp the value to the range [0.0, 1.0] to ensure valid u8 conversion
+    let clamped_value = value.clamp(0.0, 1.0);
+    // Scale the clamped value to the range [0, 255] and cast to u8
+    (clamped_value * 255.0).round() as u8
+}
+
+fn f32_vec_to_u8_vec(values: Vec<f32>) -> Vec<u8> {
+    values.iter().map(|&v| f32_to_u8(v)).collect()
+}
+
+fn map_and_read_buffer(
+    render_device: Res<RenderDevice>,
+    cpu_readback_buffers: Res<CpuReadbackBuffers>,
+    sender: ResMut<RenderWorldSender>,
+    views_q: Query<(Entity, &ViewLeds), (With<ScreenTexture>, With<ExtractedView>)>,
+) {
+    for (entity, view_leds) in views_q.iter() {
+        let Some(buffer) = cpu_readback_buffers.get(&entity) else {
+            continue;
+        };
+        let Some(buffer) = buffer.buffer() else {
+            continue;
+        };
+
+        let buffer_slice = buffer.slice(..);
+        let (s, r) = crossbeam_channel::unbounded::<()>();
+
+        buffer_slice.map_async(MapMode::Read, move |r| match r {
+            Ok(_) => s.send(()).expect("Failed to send map update"),
+            Err(err) => panic!("Failed to map buffer {err}"),
+        });
+
+        render_device.poll(Maintain::wait()).panic_on_timeout();
+
+        r.recv().expect("Failed to receive the map_async message");
+
+        {
+            let buffer_view = buffer_slice.get_mapped_range();
+            let data = buffer_view
+                .chunks(size_of::<f32>())
+                .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("should be a u32")))
+                .collect::<Vec<f32>>();
+
+            for (led_entity, led) in view_leds.materials.iter() {
+                let led_data =
+                    data[led.offset as usize..(led.offset + led.count) as usize].to_vec();
+                sender
+                    .send((*led_entity, led_data))
+                    .expect("Failed to send led data");
+            }
+        }
+        buffer.unmap();
+    }
+}
+
+// -------------------------
+// ComputePipeline
+// -------------------------
 
 #[derive(Resource)]
 struct ComputePipeline {
@@ -532,59 +547,6 @@ impl FromWorld for ComputePipeline {
             entry_point: "main".into(),
         });
         ComputePipeline { layout, pipeline }
-    }
-}
-
-fn f32_to_u8(value: f32) -> u8 {
-    // Clamp the value to the range [0.0, 1.0] to ensure valid u8 conversion
-    let clamped_value = value.clamp(0.0, 1.0);
-    // Scale the clamped value to the range [0, 255] and cast to u8
-    (clamped_value * 255.0).round() as u8
-}
-
-fn f32_vec_to_u8_vec(values: Vec<f32>) -> Vec<u8> {
-    values.iter().map(|&v| f32_to_u8(v)).collect()
-}
-
-fn map_and_read_buffer(
-    render_device: Res<RenderDevice>,
-    cpu_readback_buffers: Res<CpuReadbackBuffers>,
-    sender: ResMut<RenderWorldSender>,
-    views_q: Query<(Entity, &ViewLeds), (With<ScreenTexture>, With<ExtractedView>)>,
-) {
-    for (entity , view_leds) in views_q.iter() {
-        let Some(buffer) = cpu_readback_buffers.get(&entity) else {
-            continue;
-        };
-        let Some(buffer) = buffer.buffer() else {
-            continue;
-        };
-
-        let buffer_slice = buffer.slice(..);
-        let (s, r) = crossbeam_channel::unbounded::<()>();
-
-        buffer_slice.map_async(MapMode::Read, move |r| match r {
-            Ok(_) => s.send(()).expect("Failed to send map update"),
-            Err(err) => panic!("Failed to map buffer {err}"),
-        });
-
-        render_device.poll(Maintain::wait()).panic_on_timeout();
-
-        r.recv().expect("Failed to receive the map_async message");
-
-        {
-            let buffer_view = buffer_slice.get_mapped_range();
-            let data = buffer_view
-                .chunks(size_of::<f32>())
-                .map(|chunk| f32::from_ne_bytes(chunk.try_into().expect("should be a u32")))
-                .collect::<Vec<f32>>();
-
-            for (led_entity, led) in view_leds.materials.iter() {
-                let led_data = data[led.offset as usize..(led.offset + led.count) as usize].to_vec();
-                sender.send((*led_entity, led_data)).expect("Failed to send led data");
-            }
-        }
-        buffer.unmap();
     }
 }
 
@@ -647,6 +609,58 @@ impl ViewNode for ComputeNode {
         );
 
         Ok(())
+    }
+}
+
+// -------------------------
+// LedMaterialPipeline
+// -------------------------
+
+type DrawLedMaterial = (
+    SetItemPipeline,
+    SetMeshViewBindGroup<0>,
+    SetMaterialBindGroup<1>,
+    DrawMaterial,
+);
+
+pub struct SetMaterialBindGroup<const I: usize>;
+impl<P: PhaseItem, const I: usize> RenderCommand<P> for SetMaterialBindGroup<I> {
+    type Param = ();
+    type ViewQuery = (Entity);
+    type ItemQuery = (Read<LedMaterialBindGroup>);
+
+    #[inline]
+    fn render<'w>(
+        _item: &P,
+        (view_entity): ROQueryItem<'w, Self::ViewQuery>,
+        (bind_group): Option<ROQueryItem<'w, Self::ItemQuery>>,
+        _: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        let Some(bind_group) = bind_group else {
+            return RenderCommandResult::Failure;
+        };
+
+        pass.set_bind_group(I, &bind_group.0, &[]);
+        RenderCommandResult::Success
+    }
+}
+
+pub struct DrawMaterial;
+impl<P: PhaseItem> RenderCommand<P> for DrawMaterial {
+    type Param = ();
+    type ViewQuery = ();
+    type ItemQuery = ();
+
+    fn render<'w>(
+        _item: &P,
+        _view: ROQueryItem<'w, Self::ViewQuery>,
+        _entity: Option<ROQueryItem<'w, Self::ItemQuery>>,
+        _param: SystemParamItem<'w, '_, Self::Param>,
+        pass: &mut TrackedRenderPass<'w>,
+    ) -> RenderCommandResult {
+        pass.draw(0..4, 0..1);
+        RenderCommandResult::Success
     }
 }
 

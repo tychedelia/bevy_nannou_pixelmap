@@ -372,7 +372,6 @@ fn propagate_movement(
     }
 }
 
-
 fn despawn_removed_zones(
     mut commands: Commands,
     mut removed_zones: RemovedComponents<LedZone>,
@@ -381,7 +380,10 @@ fn despawn_removed_zones(
 ) {
     for removed_zone in removed_zones.read() {
         // Find the rectangle entity associated with the removed LedZone
-        if let Some((rect_entity, _)) = zone_refs.iter().find(|(_, zone_ref)| zone_ref.0 == removed_zone) {
+        if let Some((rect_entity, _)) = zone_refs
+            .iter()
+            .find(|(_, zone_ref)| zone_ref.0 == removed_zone)
+        {
             // Despawn the rectangle
             commands.entity(rect_entity).despawn_recursive();
 

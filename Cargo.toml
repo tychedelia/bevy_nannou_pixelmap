@@ -17,3 +17,6 @@ sacn = { git = "https://github.com/tychedelia/sacn", branch = "main" }
 [[example]]
 name = "test"
 path = "examples/test.rs"
+
+[dev-dependencies]
+nannou = { git = "https://github.com/tychedelia/nannou", branch = "955-abstract-the-nannoudraw-module-into-the-new-bevy_nannou_draw-crate-1-material" }
