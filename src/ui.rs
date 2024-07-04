@@ -1,8 +1,8 @@
-use crate::LedZone;
+use crate::LedArea;
 use bevy::prelude::*;
 use bevy::render::camera::RenderTarget;
 use bevy::render::primitives::Aabb;
-use bevy::render::view::NoFrustumCulling;
+use bevy::render::view::{NoFrustumCulling, RenderLayers};
 use bevy::sprite::{MaterialMesh2dBundle, Mesh2dHandle};
 use bevy::window::{PrimaryWindow, WindowRef};
 use bevy_mod_picking::prelude::*;
@@ -11,10 +11,10 @@ pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (setup_ui)).add_systems(
+        app.add_systems(Startup, setup_ui).add_systems(
             Update,
             (
-                despawn_removed_zones,
+                despawn_removed_areas,
                 propagate_movement,
                 update_corner_positions,
                 spawn_led,
@@ -52,11 +52,14 @@ struct CursorState {
 struct Hover;
 
 #[derive(Component)]
-pub struct ZoneRef(Entity);
+pub struct AreaRef(Entity);
+
+#[derive(Component)]
+pub struct MeshRef(Entity);
 
 fn spawn_led(
     mut commands: Commands,
-    added_leds_q: Query<(Entity, &LedZone), Added<LedZone>>,
+    added_leds_q: Query<(Entity, &LedArea), Added<LedArea>>,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<ColorMaterial>>,
 ) {
@@ -71,7 +74,7 @@ fn spawn_led(
                     mesh: meshes.add(Rectangle::new(led.size.x, led.size.y)).into(),
                     transform: Transform::from_xyz(center.x, center.y, 0.0)
                         .with_rotation(Quat::from_rotation_z(led.rotation)),
-                    material: materials.add(ColorMaterial::from(Color::NONE)),
+                    material: materials.add(ColorMaterial::from(Color::srgba(0.1, 0.1, 0.1, 0.1))),
                     ..default()
                 },
                 PickableBundle::default(), // <- Makes the mesh pickable.
@@ -81,7 +84,7 @@ fn spawn_led(
                 On::<Pointer<Over>>::target_insert(Hover),
                 On::<Pointer<Out>>::target_remove::<Hover>(),
             ))
-            .insert(ZoneRef(entity))
+            .insert(AreaRef(entity))
             .id();
         [
             (Vec2::new(-250.0, -25.0), ResizeHandle::BottomLeft),
@@ -129,6 +132,8 @@ fn spawn_led(
                 ))
                 .set_parent(drag_circle);
         });
+
+        commands.entity(entity).insert(MeshRef(rect));
     }
 }
 
@@ -195,14 +200,6 @@ fn drag_body(event: Listener<Pointer<Drag>>, mut transform_q: Query<&mut Transfo
     let mut transform = transform_q.get_mut(event.target).unwrap();
     transform.translation.x += event.delta.x; // Make the square follow the mouse
     transform.translation.y -= event.delta.y;
-}
-
-fn calculate_scale_factor(current_scale: Vec2, current_position: Vec2, new_position: Vec2) -> Vec2 {
-    let delta = new_position - current_position;
-    Vec2::new(
-        (current_scale.x + delta.x) / current_scale.x,
-        (current_scale.y + delta.y) / current_scale.y,
-    )
 }
 
 fn resize_rectangle(
@@ -301,9 +298,12 @@ fn setup_ui(mut commands: Commands) {
     commands.spawn((
         Camera2dBundle {
             camera: Camera {
+                hdr: true,
                 order: 10,
+                // clear_color: ClearColorConfig::None,
                 ..default()
             },
+            transform: Transform::from_xyz(0.0, 0.0, 10.0),
             ..default()
         },
         UiCamera,
@@ -316,7 +316,7 @@ fn propagate_movement(
     windows_q: Query<&Window>,
     primary_window_q: Query<&Window, With<PrimaryWindow>>,
     meshes_q: Query<(&Transform, &Aabb)>,
-    mut led_q: Query<(&mut LedZone, &Parent)>,
+    mut led_q: Query<(&mut LedArea, &MeshRef)>,
 ) {
     let (ui_camera, ui_camera_transform) = camera_q.single();
     let RenderTarget::Window(window_ref) = ui_camera.target else {
@@ -327,8 +327,8 @@ fn propagate_movement(
         WindowRef::Entity(window) => windows_q.get(window).unwrap(),
     };
 
-    for (mut led, parent) in led_q.iter_mut() {
-        let Ok((parent_transform, parent_aabb)) = meshes_q.get(parent.get()) else {
+    for (mut led, mesh_ref) in led_q.iter_mut() {
+        let Ok((parent_transform, parent_aabb)) = meshes_q.get(mesh_ref.0) else {
             continue;
         };
 
@@ -348,41 +348,48 @@ fn propagate_movement(
             .map(|corner| corner.truncate())
             .collect();
 
-        // Calculate the width and height in world space
-        let width = (world_corners[1] - world_corners[0]).length();
-        let height = (world_corners[3] - world_corners[0]).length();
+        // Convert all corners to screen space
+        let screen_corners: Vec<Vec2> = world_corners
+            .iter()
+            .map(|&corner| {
+                ui_camera
+                    .world_to_viewport(ui_camera_transform, corner)
+                    .unwrap()
+                    .xy()
+                    // * window.scale_factor()
+            })
+            .collect();
 
-        // Convert the top-left corner to screen space
-        let top_left_screen = ui_camera
-            .world_to_viewport(ui_camera_transform, world_corners[3])
-            .unwrap()
-            .xy()
-            * window.scale_factor() as f32;
+        // Calculate the size in screen space
+        let size_screen = Vec2::new(
+            (screen_corners[1].x - screen_corners[0].x).abs(),
+            (screen_corners[3].y - screen_corners[0].y).abs()
+        );
 
-        // Calculate the size in screen space using the width and height
-        let size_screen = Vec2::new(width, height) * window.scale_factor() as f32;
+        // Top-left corner in screen space
+        let top_left_screen = screen_corners[3];
 
         // Extract the rotation from the transform
         let (_, _, rotation) = parent_transform.rotation.to_euler(EulerRot::XYZ); // Z rotation in radians
 
-        // Update the LedZone
+        // Update the LedArea
         led.position = top_left_screen;
         led.size = size_screen;
         led.rotation = rotation;
     }
 }
 
-fn despawn_removed_zones(
+fn despawn_removed_areas(
     mut commands: Commands,
-    mut removed_zones: RemovedComponents<LedZone>,
-    zone_refs: Query<(Entity, &ZoneRef)>,
+    mut removed_areas: RemovedComponents<LedArea>,
+    area_refs: Query<(Entity, &AreaRef)>,
     corner_query: Query<(Entity, &DragCorner)>,
 ) {
-    for removed_zone in removed_zones.read() {
-        // Find the rectangle entity associated with the removed LedZone
-        if let Some((rect_entity, _)) = zone_refs
+    for removed_area in removed_areas.read() {
+        // Find the rectangle entity associated with the removed LedArea
+        if let Some((rect_entity, _)) = area_refs
             .iter()
-            .find(|(_, zone_ref)| zone_ref.0 == removed_zone)
+            .find(|(_, area_ref)| area_ref.0 == removed_area)
         {
             // Despawn the rectangle
             commands.entity(rect_entity).despawn_recursive();

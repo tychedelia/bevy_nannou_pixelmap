@@ -1,6 +1,8 @@
+use ::nannou::prelude::render::NannouCamera;
 use std::borrow::Cow;
 
 use bevy::asset::load_internal_asset;
+use bevy::core_pipeline::bloom::BloomSettings;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
 use bevy::core_pipeline::core_3d::{Transparent3d, CORE_3D_DEPTH_FORMAT};
 use bevy::core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
@@ -34,11 +36,13 @@ use bevy::render::render_resource::binding_types::{
 use bevy::render::renderer::RenderQueue;
 use bevy::render::texture::{BevyDefault, FallbackImage, GpuImage};
 use bevy::render::view::{
-    check_visibility, ExtractedView, NoFrustumCulling, ViewTarget, ViewUniform, ViewUniformOffset,
-    ViewUniforms, VisibleEntities, WithMesh,
+    check_visibility, ExtractedView, NoFrustumCulling, RenderLayers, ViewTarget, ViewUniform,
+    ViewUniformOffset, ViewUniforms, VisibleEntities, WithMesh,
 };
 use bevy::render::Extract;
-use bevy::window::{PrimaryWindow, WindowClosing, WindowRef};
+use bevy::window::{
+    PrimaryWindow, WindowClosing, WindowRef, WindowResized, WindowScaleFactorChanged,
+};
 use bevy::{
     prelude::*,
     render::{
@@ -54,8 +58,11 @@ pub use sacn;
 
 use crate::ui::UiPlugin;
 
+mod nannou;
 mod sacn_src;
 mod ui;
+
+pub use crate::nannou::*;
 
 const COMPUTE_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(966169125558327);
 const MATERIAL_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(116169934631328);
@@ -80,17 +87,22 @@ impl Plugin for NannouPixelmapPlugin {
         app.add_plugins((
             UiPlugin,
             DefaultPickingPlugins,
-            ExtractComponentPlugin::<LedZone>::default(),
+            ExtractComponentPlugin::<LedArea>::default(),
             ExtractComponentPlugin::<ScreenTexture>::default(),
             ExtractComponentPlugin::<ScreenTextureCamera>::default(),
         ))
-        .add_systems(PostUpdate, check_visibility::<With<LedZone>>)
-        .add_systems(First, spawn_screen_textures);
+        .add_systems(PostUpdate, check_visibility::<With<LedArea>>)
+        .add_systems(
+            PreUpdate,
+            (spawn_screen_textures, update_cameras, resize_texture),
+        );
     }
 
     fn finish(&self, app: &mut App) {
         let (s, r) = crossbeam_channel::unbounded();
-        app.insert_resource(LedDataReceiver(r));
+        app.add_event::<LedData>()
+            .add_systems(First, send_led_data)
+            .insert_resource(LedDataReceiver(r));
 
         let render_app = app.sub_app_mut(RenderApp);
         render_app
@@ -124,8 +136,16 @@ impl Plugin for NannouPixelmapPlugin {
             );
     }
 }
+
+// -------------------------
+// Components & Resources
+// -------------------------
+
+#[derive(Event)]
+pub struct LedData(pub Entity, pub Vec<f32>);
+
 #[derive(Resource, Deref)]
-pub struct LedDataReceiver(Receiver<(Entity, Vec<f32>)>);
+struct LedDataReceiver(Receiver<(Entity, Vec<f32>)>);
 #[derive(Resource, Deref)]
 struct RenderWorldSender(Sender<(Entity, Vec<f32>)>);
 
@@ -141,19 +161,28 @@ struct CpuReadbackBuffers(EntityHashMap<RawBufferVec<LinearRgba>>);
 #[derive(Component, ExtractComponent, Clone)]
 struct ScreenTextureCamera;
 
+#[derive(Component, ExtractComponent, Clone)]
+struct ScreenMaterialCamera;
+
 #[derive(Component, Clone)]
 struct ScreenTextureCameraRef(pub Entity);
 
+#[derive(Component, Clone)]
+struct ScreenMaterialCameraRef(pub Entity);
+
 #[derive(Component, ExtractComponent, Clone)]
-pub struct ScreenTexture(pub Handle<Image>);
+pub struct ScreenTexture {
+    window: Entity,
+    texture: Handle<Image>,
+}
 
 #[derive(Resource, Deref, DerefMut, Default)]
 struct ComputeBindGroups(EntityHashMap<BindGroup>);
 
 #[derive(Bundle, Default)]
 pub struct LedBundle {
-    /// The led's zone.
-    pub zone: LedZone,
+    /// The led's area.
+    pub area: LedArea,
     /// The visibility of the entity.
     pub visibility: Visibility,
     /// The inherited visibility of the entity.
@@ -169,16 +198,16 @@ pub struct LedBundle {
 }
 
 #[derive(Component, ExtractComponent, Clone)]
-pub struct LedZone {
+pub struct LedArea {
     pub count: u32,
     pub rotation: f32,
     pub position: Vec2,
     pub size: Vec2,
 }
 
-impl Default for LedZone {
+impl Default for LedArea {
     fn default() -> Self {
-        LedZone {
+        LedArea {
             count: 1,
             rotation: 0.0,
             position: Vec2::ZERO,
@@ -216,32 +245,47 @@ pub struct ViewLeds {
 // Systems
 // -------------------------
 
+fn send_led_data(mut receiver: ResMut<LedDataReceiver>, mut events: EventWriter<LedData>) {
+    while let Ok((entity, data)) = receiver.0.try_recv() {
+        events.send(LedData(entity, data));
+    }
+}
+
 fn spawn_screen_textures(
     mut commands: Commands,
     camera_q: Query<
-        (Entity, &Camera, &Transform),
+        (
+            Entity,
+            &Camera,
+            &Transform,
+            &Projection,
+            Option<&RenderLayers>,
+            Option<&BloomSettings>,
+        ),
         (
             With<Camera3d>,
+            With<NannouCamera>,
             Without<ScreenTexture>,
             Without<ScreenTextureCamera>,
+            Without<ScreenMaterialCamera>,
         ),
     >,
     mut images: ResMut<Assets<Image>>,
-    windows_q: Query<&Window>,
-    primary_window_q: Query<&Window, With<PrimaryWindow>>,
+    windows_q: Query<(Entity, &Window)>,
+    primary_window_q: Query<(Entity, &Window), With<PrimaryWindow>>,
 ) {
-    for (entity, cam, cam_transform) in camera_q.iter() {
+    for (entity, cam, cam_transform, projection, render_layers, bloom_settings) in camera_q.iter() {
         let RenderTarget::Window(window_target) = cam.target else {
             panic!("Camera target should be a window");
         };
-        let window = match window_target {
+        let (window_entity, window) = match window_target {
             WindowRef::Primary => primary_window_q.single(),
             WindowRef::Entity(window) => windows_q.get(window).unwrap(),
         };
 
         let size = Extent3d {
-            width: (window.physical_width() as f32 * window.scale_factor()) as u32,
-            height: (window.physical_height() as f32 * window.scale_factor()) as u32,
+            width: (window.physical_width()) as u32,
+            height: (window.physical_height()) as u32,
             ..default()
         };
         let mut image = Image {
@@ -272,32 +316,149 @@ fn spawn_screen_textures(
                 Camera3dBundle {
                     transform: cam_transform.clone(),
                     camera: Camera {
+                        hdr: cam.hdr,
                         order: cam.order - 1, // always render before the camera
                         target: RenderTarget::Image(image.clone()),
-                        ..default()
+                        clear_color: cam.clear_color,
+                        ..cam.clone()
                     },
+                    projection: projection.clone(),
                     ..default()
                 },
                 ScreenTextureCamera,
             ))
             .id();
+        let screen_material_camera = commands
+            .spawn((
+                Camera3dBundle {
+                    transform: cam_transform.clone(),
+                    camera: Camera {
+                        hdr: cam.hdr,
+                        order: cam.order + 100, // always render after the camera
+                        target: cam.target.clone(),
+                        clear_color: ClearColorConfig::None,
+                        ..cam.clone()
+                    },
+                    projection: projection.clone(),
+                    ..default()
+                },
+                RenderLayers::layer(32),
+                ScreenMaterialCamera,
+            ))
+            .id();
+
+        if let Some(render_layers) = render_layers {
+            commands
+                .entity(screen_texture_camera)
+                .insert(render_layers.clone());
+        }
+        if let Some(bloom_settings) = bloom_settings {
+            commands
+                .entity(screen_texture_camera)
+                .insert(bloom_settings.clone());
+        }
 
         info!("Spawning screen texture camera {screen_texture_camera} for camera {entity}");
         commands.entity(entity).insert((
-            ScreenTexture(image),
+            ScreenTexture {
+                window: window_entity,
+                texture: image,
+            },
             ScreenTextureCameraRef(screen_texture_camera),
+            ScreenMaterialCameraRef(screen_material_camera),
         ));
     }
 }
+
+fn resize_texture(
+    mut window_resized: EventReader<WindowResized>,
+    mut window_scale_factor_changed: EventReader<WindowScaleFactorChanged>,
+    mut images: ResMut<Assets<Image>>,
+    mut screen_textures: Query<(&mut ScreenTexture)>,
+    windows_q: Query<(&Window)>,
+) {
+    for resized in window_resized.read() {
+        for (screen_texture) in screen_textures.iter() {
+            if screen_texture.window != resized.window {
+                continue;
+            }
+
+            let (window) = windows_q.get(screen_texture.window).unwrap();
+            let size = Extent3d {
+                width: window.physical_width(),
+                height: window.physical_height(),
+                ..default()
+            };
+            let mut image = images.get_mut(&screen_texture.texture).unwrap();
+            image.resize(size);
+        }
+    }
+
+    for scale_factor_changed in window_scale_factor_changed.read() {
+        for (screen_texture) in screen_textures.iter() {
+            if screen_texture.window != scale_factor_changed.window {
+                continue;
+            }
+
+            let (window) = windows_q.get(screen_texture.window).unwrap();
+            let size = Extent3d {
+                width: window.physical_width() ,
+                height: window.physical_height() ,
+                ..default()
+            };
+            let mut image = images.get_mut(&screen_texture.texture).unwrap();
+            image.resize(size);
+        }
+    }
+}
+
+fn update_cameras(
+    camera_q: Query<
+        (
+            &Camera,
+            &Transform,
+            Option<&BloomSettings>,
+            &ScreenTexture,
+            &ScreenTextureCameraRef,
+            &ScreenMaterialCameraRef,
+        ),
+        With<NannouCamera>,
+    >,
+    mut update_camera_q: Query<
+        (&mut Camera, &mut Transform, Option<&mut BloomSettings>),
+        Without<NannouCamera>,
+    >,
+) {
+    for (
+        parent_cam,
+        parent_transform,
+        parent_bloom_settings,
+        screen_texture,
+        screen_texture_camera,
+        screen_material_camera,
+    ) in camera_q.iter()
+    {
+        let (mut cam, mut cam_transform, mut bloom_settings) =
+            update_camera_q.get_mut(screen_texture_camera.0).unwrap();
+
+        cam.clear_color = parent_cam.clear_color;
+        if let (Some(mut bloom_settings), Some(parent_bloom_settings)) =
+            (bloom_settings, parent_bloom_settings)
+        {
+            *bloom_settings = parent_bloom_settings.clone();
+        }
+    }
+}
+
 fn queue_leds(
     mut commands: Commands,
     views: Query<(Entity, &ExtractedView, &VisibleEntities), Without<ScreenTextureCamera>>,
     gpu_output: Res<GpuOutputBuffers>,
-    leds: Query<&LedZone>,
+    leds: Query<&LedArea>,
 ) {
     for (view_entity, view, visible_entities) in views.iter() {
         let mut view_leds = ViewLeds::default();
-        for visible in visible_entities.iter::<With<LedZone>>() {
+        for visible in visible_entities.iter::<With<LedArea>>() {
             let mut idx = 0;
             if let Ok(led) = leds.get(*visible) {
                 view_leds.work_items.insert(
@@ -389,7 +550,7 @@ fn prepare_bind_groups(
 ) {
     for (entity, screen_texture, view_leds) in &views {
         let screen_texture = gpu_images
-            .get(&screen_texture.0)
+            .get(&screen_texture.texture)
             .expect("image should exist");
 
         let Some(view_uniforms_binding) = view_uniforms.uniforms.binding() else {
@@ -493,12 +654,46 @@ fn map_and_read_buffer(
             for (led_entity, led) in view_leds.materials.iter() {
                 let led_data =
                     data[led.offset as usize..(led.offset + led.count) as usize].to_vec();
-                sender
-                    .send((*led_entity, led_data))
-                    .expect("Failed to send led data");
+                let _ = sender.send((*led_entity, led_data));
             }
         }
         buffer.unmap();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn queue_led_material(
+    transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
+    custom_pipeline: Res<LedMaterialPipeline>,
+    msaa: Res<Msaa>,
+    mut pipelines: ResMut<SpecializedRenderPipelines<LedMaterialPipeline>>,
+    pipeline_cache: Res<PipelineCache>,
+    materials: Query<Entity, With<LedArea>>,
+    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
+    mut views: Query<(Entity, &ExtractedView), Without<ScreenTextureCamera>>,
+) {
+    let draw_function = transparent_3d_draw_functions.read().id::<DrawLedMaterial>();
+
+    for (view_entity, view) in &mut views {
+        let Some(transparent_phase) = transparent_render_phases.get_mut(&view_entity) else {
+            continue;
+        };
+
+        for entity in &materials {
+            let key = LedMaterialPipelineKey {
+                hdr: view.hdr,
+                samples: msaa.samples(),
+            };
+            let pipeline = pipelines.specialize(&pipeline_cache, &custom_pipeline, key);
+            transparent_phase.add(Transparent3d {
+                entity,
+                pipeline,
+                draw_function,
+                distance: 0.0,
+                batch_range: 0..1,
+                extra_index: PhaseItemExtraIndex::NONE,
+            });
+        }
     }
 }
 
@@ -562,7 +757,7 @@ impl ViewNode for ComputeNode {
 
     fn run<'w>(
         &self,
-        graph: &mut RenderGraphContext,
+        _graph: &mut RenderGraphContext,
         render_context: &mut RenderContext<'w>,
         (view_entity, view_uniform): QueryItem<'w, Self::ViewQuery>,
         world: &'w World,
@@ -746,42 +941,6 @@ impl SpecializedRenderPipeline for LedMaterialPipeline {
                 ..default()
             },
             push_constant_ranges: vec![],
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn queue_led_material(
-    transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
-    custom_pipeline: Res<LedMaterialPipeline>,
-    msaa: Res<Msaa>,
-    mut pipelines: ResMut<SpecializedRenderPipelines<LedMaterialPipeline>>,
-    pipeline_cache: Res<PipelineCache>,
-    materials: Query<Entity, With<LedZone>>,
-    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
-    mut views: Query<(Entity, &ExtractedView), Without<ScreenTextureCamera>>,
-) {
-    let draw_function = transparent_3d_draw_functions.read().id::<DrawLedMaterial>();
-
-    for (view_entity, view) in &mut views {
-        let Some(transparent_phase) = transparent_render_phases.get_mut(&view_entity) else {
-            continue;
-        };
-
-        for entity in &materials {
-            let key = LedMaterialPipelineKey {
-                hdr: view.hdr,
-                samples: msaa.samples(),
-            };
-            let pipeline = pipelines.specialize(&pipeline_cache, &custom_pipeline, key);
-            transparent_phase.add(Transparent3d {
-                entity,
-                pipeline,
-                draw_function,
-                distance: 0.0,
-                batch_range: 0..1,
-                extra_index: PhaseItemExtraIndex::NONE,
-            });
         }
     }
 }

@@ -45,7 +45,6 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         for (var x = start_pos.x; x < end_pos.x; x += step_x) {
             for (var y = start_pos.y; y < end_pos.y; y += step_y) {
-                // Rotate the point around the center of the area_position
                 let local_x = x - led_data.area_position.x;
                 let local_y = y - led_data.area_position.y;
 
