@@ -1,7 +1,8 @@
-use crate::{LedArea, LedBundle};
-use bevy::prelude::{Entity, Vec2};
+use crate::{LedArea, LedBundle, ReceivedData};
+use bevy::prelude::{Entity, ResMut, Trigger, Vec2};
 use bevy::render::view::RenderLayers;
 use bevy::utils::default;
+use nannou::app::ModelHolder;
 
 pub trait SetPixelmap: Sized {
     fn count(self, count: u32) -> Self {
@@ -39,36 +40,57 @@ pub trait SetPixelmap: Sized {
         })
     }
 
+    fn samples(self, samples: u32) -> Self {
+        self.map_leds(|mut bundle| {
+            bundle.area.num_samples = samples;
+            bundle
+        })
+    }
+
     fn map_leds(self, f: impl FnOnce(LedBundle) -> LedBundle) -> Self;
 }
 
-pub struct Builder<'a, 'w> {
+pub struct Builder<'a, 'w, M>
+where
+    M: Send + Sync + 'static,
+{
     app: &'a nannou::App<'w>,
     leds: LedBundle,
+    _marker: std::marker::PhantomData<M>,
 }
 
-impl<'a, 'w> Builder<'a, 'w> {
+impl<'a, 'w, M> Builder<'a, 'w, M>
+where
+    M: Send + Sync + 'static,
+{
     pub fn new(app: &'a nannou::App<'w>) -> Self {
         Self {
             app,
             leds: Default::default(),
+            _marker: Default::default(),
         }
     }
 
-    pub fn build(self) -> Entity {
+    pub fn build(
+        mut self,
+        mut callback: impl FnMut(Trigger<ReceivedData>, &mut M) + Send + Sync + 'static,
+    ) -> Entity {
         let world = unsafe { self.app.unsafe_world_mut() };
         world
-            .spawn(
-                (
-                    self.leds
-                    // , RenderLayers::layer(32)
-                ),
+            .spawn((self.leds, RenderLayers::layer(32)))
+            .observe(
+                move |trigger: Trigger<ReceivedData>, mut model: ResMut<ModelHolder<M>>| {
+                    callback(trigger, &mut model.0);
+                },
             )
             .id()
     }
 }
 
-impl SetPixelmap for Builder<'_, '_> {
+impl<M> SetPixelmap for Builder<'_, '_, M>
+where
+    M: Send + Sync + 'static,
+{
     fn map_leds(self, f: impl FnOnce(LedBundle) -> LedBundle) -> Self {
         Self {
             leds: f(self.leds),
@@ -106,11 +128,16 @@ impl SetPixelmap for PixelmapArea<'_, '_> {
 
 pub trait AppPixelmapExt<'w> {
     /// Begin building a new camera.
-    fn new_pixelmap<'a>(&'a self) -> Builder<'a, 'w>;
+    fn new_pixelmap<'a, M>(&'a self) -> Builder<'a, 'w, M>
+    where
+        M: Send + Sync + 'static;
 }
 
 impl<'w> AppPixelmapExt<'w> for nannou::App<'w> {
-    fn new_pixelmap<'a>(&'a self) -> Builder<'a, 'w> {
+    fn new_pixelmap<'a, M>(&'a self) -> Builder<'a, 'w, M>
+    where
+        M: Send + Sync + 'static,
+    {
         Builder::new(self)
     }
 }

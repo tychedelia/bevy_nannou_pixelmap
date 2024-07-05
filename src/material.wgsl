@@ -7,7 +7,6 @@
 @group(1) @binding(0) var<uniform> material: LedMaterial;
 @group(1) @binding(1) var<storage, read> average_colors: array<vec4<f32>>;
 
-
 struct LedMaterial {
     offset: u32,
     rotation: f32,
@@ -15,7 +14,6 @@ struct LedMaterial {
     position: vec2<f32>,
     size: vec2<f32>,
 }
-
 
 struct Vertex {
     @builtin(vertex_index) index: u32,
@@ -75,12 +73,15 @@ fn vertex(vertex: Vertex) -> VertexOutput {
     return out;
 }
 
-
 @fragment
 fn fragment(
     mesh: VertexOutput,
 ) -> @location(0) vec4<f32> {
-    let uv = mesh.uv;
+    let uv = mesh.uv * material.size / max(material.size.x, material.size.y);
+//    if (uv.x < 0.01 || uv.x > 0.99 || uv.y < 0.01 || uv.y > 0.99) {
+//        return vec4(1.0, 1.0, 1.0, 1.0);
+//    }
+
     // Use the led count divided by the uv to determine the color
     let led_range = (uv.x * f32(material.count));
     let led_index = u32(led_range);

@@ -1,6 +1,10 @@
 use bevy::tasks::futures_lite::StreamExt;
 use bevy_nannou_pixelmap::*;
 use nannou::prelude::*;
+use sacn::packet::ACN_SDT_MULTICAST_PORT;
+use sacn::source::SacnSource;
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use artnet_protocol::{ArtCommand, Output};
 
 fn main() {
     nannou::app(model)
@@ -13,6 +17,7 @@ struct Model {
     window: Entity,
     camera: Entity,
     pixelmap: Entity,
+    socket: UdpSocket,
 }
 
 fn model(app: &App) -> Model {
@@ -21,6 +26,7 @@ fn model(app: &App) -> Model {
         // HDR is required for bloom to work.
         .hdr(true)
         // Pick a default bloom settings. This also can be configured manually.
+        .bloom_settings(BloomSettings::OLD_SCHOOL)
         .build();
 
     let window = app
@@ -35,13 +41,28 @@ fn model(app: &App) -> Model {
         .new_pixelmap()
         .count(12)
         .x_y(100.0, 100.0)
-        .w_h(400.0, 40.0)
-        .build();
+        .w_h(200.0, 20.0)
+        .build(|evt, model: &mut Model| {
+            let broadcast_addr = ("192.168.2.4", 6454).to_socket_addrs().unwrap().next().unwrap();
+            let command = ArtCommand::Output(Output {
+                data: evt.event().iter().map(|x|(*x * 255.0) as u8).collect::<Vec<u8>>().into(),
+                ..Output::default()
+            });
+            let bytes = command.write_to_buffer().unwrap();
+            model
+                .socket
+                .send_to(&bytes, broadcast_addr).unwrap();
+        });
+
+    let socket = UdpSocket::bind(("0.0.0.0", 6454)).unwrap();
+    socket.set_broadcast(true).unwrap();
+
 
     Model {
         camera,
         window,
         pixelmap,
+        socket,
     }
 }
 
@@ -50,44 +71,35 @@ fn update(app: &App, model: &mut Model) {
     let window_rect = app.window_rect();
     let norm_mouse_y = (app.mouse().y / window_rect.w()) + 0.5;
 
+    camera.bloom_intensity(norm_mouse_y.clamp(0.0, 0.8));
 }
 
 fn view(app: &App, model: &Model) {
-    // Begin drawing
     let draw = app.draw();
-
-    // Clear the background to blue.
-    draw.background().color(CORNFLOWER_BLUE);
-
-    // Draw a purple triangle in the top left half of the window.
-    let win = app.window_rect();
-    draw.tri()
-        .points(win.bottom_left(), win.top_left(), win.top_right())
-        .color(VIOLET);
-
-    // Draw an ellipse to follow the mouse.
+    draw.background().color(Color::gray(0.1));
     let t = app.elapsed_seconds();
+    let window_rect = app.window_rect();
+    let norm_mouse_x = (app.mouse().x / window_rect.w()) + 0.5;
+    let color_hsl = Color::hsl((1.0 - norm_mouse_x) * 360.0, 1.0, 0.5);
+    let mut color_linear_rgb: LinearRgba = color_hsl.into();
+    color_linear_rgb = color_linear_rgb * 5.0;
+
+    let x1 = 300.0 * (t * 1.0).sin();
+    let y1 = 200.0 * (t * 1.5).cos();
     draw.ellipse()
-        .x_y(app.mouse().x * t.cos(), app.mouse().y)
-        .radius(win.w() * 0.125 * t.sin())
-        .color(RED);
+        .x_y(x1, y1)
+        .w_h(100.0, 100.0)
+        .emissive(color_linear_rgb);
 
-    // Draw a line!
-    draw.line()
-        .weight(10.0 + (t.sin() * 0.5 + 0.5) * 90.0)
-        .caps_round()
-        .color(PALE_GOLDENROD)
-        .points(win.top_left() * t.sin(), win.bottom_right() * t.cos());
+    let color_hsl = Color::hsl(norm_mouse_x * 360.0, 1.0, 0.5);
+    let mut color_linear_rgb: LinearRgba = color_hsl.into();
+    color_linear_rgb = color_linear_rgb * 5.0;
 
-    // Draw a quad that follows the inverse of the ellipse.
-    draw.quad()
-        .x_y(-app.mouse().x, app.mouse().y)
-        .color(DARK_GREEN)
-        .rotate(t);
+    let x2 = -300.0 * (t * 1.0).cos();
+    let y2 = -200.0 * (t * 1.5).sin();
+    draw.ellipse()
+        .x_y(x2, y2)
+        .w_h(100.0, 100.0)
+        .emissive(color_linear_rgb);
 
-    // Draw a rect that follows a different inverse of the ellipse.
-    draw.rect()
-        .x_y(app.mouse().y, app.mouse().x)
-        .w(app.mouse().x * 0.25)
-        .hsv(t, 1.0, 1.0);
 }

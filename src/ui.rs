@@ -74,7 +74,7 @@ fn spawn_led(
                     mesh: meshes.add(Rectangle::new(led.size.x, led.size.y)).into(),
                     transform: Transform::from_xyz(center.x, center.y, 0.0)
                         .with_rotation(Quat::from_rotation_z(led.rotation)),
-                    material: materials.add(ColorMaterial::from(Color::srgba(0.1, 0.1, 0.1, 0.1))),
+                    material: materials.add(ColorMaterial::from(Color::NONE)),
                     ..default()
                 },
                 PickableBundle::default(), // <- Makes the mesh pickable.
@@ -248,8 +248,6 @@ fn resize_rectangle(
     rectangle_transform.scale = new_scale.extend(1.0);
     rectangle_transform.translation =
         (current_position + position_change).extend(rectangle_transform.translation.z);
-
-    println!("New transform: {:?}", rectangle_transform);
 }
 
 fn update_corner_positions(
@@ -299,8 +297,8 @@ fn setup_ui(mut commands: Commands) {
         Camera2dBundle {
             camera: Camera {
                 hdr: true,
-                order: 10,
-                // clear_color: ClearColorConfig::None,
+                order: 3,
+                clear_color: ClearColorConfig::None,
                 ..default()
             },
             transform: Transform::from_xyz(0.0, 0.0, 10.0),
@@ -356,14 +354,14 @@ fn propagate_movement(
                     .world_to_viewport(ui_camera_transform, corner)
                     .unwrap()
                     .xy()
-                    // * window.scale_factor()
+                    * window.scale_factor()
             })
             .collect();
 
         // Calculate the size in screen space
         let size_screen = Vec2::new(
             (screen_corners[1].x - screen_corners[0].x).abs(),
-            (screen_corners[3].y - screen_corners[0].y).abs()
+            (screen_corners[3].y - screen_corners[0].y).abs(),
         );
 
         // Top-left corner in screen space

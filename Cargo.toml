@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-bevy = "0.14.0-rc.4"
+artnet_protocol = "0.4.2"
+bevy = "0.14.0"
 crossbeam-channel = "0.5.13"
 socket2 = { version = "0.5.7", features = ["all"] }
 bytemuck = "1"

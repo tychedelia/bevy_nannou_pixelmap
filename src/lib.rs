@@ -1,10 +1,11 @@
+use ::nannou::prelude::bevy_render::render_phase::ViewBinnedRenderPhases;
 use ::nannou::prelude::render::NannouCamera;
 use std::borrow::Cow;
 
 use bevy::asset::load_internal_asset;
 use bevy::core_pipeline::bloom::BloomSettings;
 use bevy::core_pipeline::core_3d::graph::{Core3d, Node3d};
-use bevy::core_pipeline::core_3d::{Transparent3d, CORE_3D_DEPTH_FORMAT};
+use bevy::core_pipeline::core_3d::{Opaque3d, Opaque3dBinKey, CORE_3D_DEPTH_FORMAT};
 use bevy::core_pipeline::fullscreen_vertex_shader::fullscreen_shader_vertex_state;
 use bevy::ecs::entity::EntityHashMap;
 use bevy::ecs::query::{QueryItem, ROQueryItem};
@@ -27,8 +28,8 @@ use bevy::render::render_graph::{
     NodeRunError, RenderGraphApp, RenderGraphContext, ViewNode, ViewNodeRunner,
 };
 use bevy::render::render_phase::{
-    AddRenderCommand, DrawFunctions, PhaseItem, PhaseItemExtraIndex, RenderCommand,
-    RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
+    AddRenderCommand, BinnedRenderPhaseType, DrawFunctions, PhaseItem, PhaseItemExtraIndex,
+    RenderCommand, RenderCommandResult, SetItemPipeline, TrackedRenderPass, ViewSortedRenderPhases,
 };
 use bevy::render::render_resource::binding_types::{
     sampler, storage_buffer_read_only, texture_2d, uniform_buffer,
@@ -58,11 +59,11 @@ pub use sacn;
 
 use crate::ui::UiPlugin;
 
-mod nannou;
+mod app;
 mod sacn_src;
 mod ui;
 
-pub use crate::nannou::*;
+pub use crate::app::*;
 
 const COMPUTE_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(966169125558327);
 const MATERIAL_SHADER_HANDLE: Handle<Shader> = Handle::weak_from_u128(116169934631328);
@@ -90,6 +91,7 @@ impl Plugin for NannouPixelmapPlugin {
             ExtractComponentPlugin::<LedArea>::default(),
             ExtractComponentPlugin::<ScreenTexture>::default(),
             ExtractComponentPlugin::<ScreenTextureCamera>::default(),
+            ExtractComponentPlugin::<ScreenMaterialCamera>::default(),
         ))
         .add_systems(PostUpdate, check_visibility::<With<LedArea>>)
         .add_systems(
@@ -100,8 +102,48 @@ impl Plugin for NannouPixelmapPlugin {
 
     fn finish(&self, app: &mut App) {
         let (s, r) = crossbeam_channel::unbounded();
-        app.add_event::<LedData>()
+        app.add_event::<ReceivedData>()
             .add_systems(First, send_led_data)
+            .add_systems(
+                Update,
+                |mut commands: Commands,
+                 images: Res<Assets<Image>>,
+                 screen_texture_q: Query<&ScreenTexture>,
+                 input: Res<ButtonInput<KeyCode>>| {
+                    if input.just_pressed(KeyCode::Space) {
+                        for screen_texture in screen_texture_q.iter() {
+                            let image = images.get(&screen_texture.texture).unwrap();
+                            let mut window = Window::default();
+                            let scale_factor = window.resolution.scale_factor();
+                            let window_size = image.size_f32() * scale_factor;
+                            let render_layer = RenderLayers::layer(30);
+                            window.resolution.set_physical_resolution(
+                                window_size.x as u32,
+                                window_size.y as u32,
+                            );
+
+                            commands.spawn((
+                                SpriteBundle {
+                                    texture: screen_texture.texture.clone(),
+                                    ..default()
+                                },
+                                render_layer.clone(),
+                            ));
+                            let window = commands.spawn(window).id();
+                            commands.spawn((
+                                Camera2dBundle {
+                                    camera: Camera {
+                                        target: RenderTarget::Window(WindowRef::Entity(window)),
+                                        ..default()
+                                    },
+                                    ..default()
+                                },
+                                render_layer.clone(),
+                            ));
+                        }
+                    }
+                },
+            )
             .insert_resource(LedDataReceiver(r));
 
         let render_app = app.sub_app_mut(RenderApp);
@@ -115,14 +157,15 @@ impl Plugin for NannouPixelmapPlugin {
             .add_systems(
                 Render,
                 (
-                    queue_led_material.in_set(RenderSet::QueueMeshes),
-                    queue_leds.in_set(RenderSet::Queue),
+                    (queue_leds, queue_led_material)
+                        .chain()
+                        .in_set(RenderSet::Queue),
                     prepare_buffers.in_set(RenderSet::PrepareResources),
                     prepare_bind_groups.in_set(RenderSet::PrepareBindGroups),
                     map_and_read_buffer.after(RenderSet::Render),
                 ),
             )
-            .add_render_command::<Transparent3d, DrawLedMaterial>()
+            .add_render_command::<Opaque3d, DrawLedMaterial>()
             .init_resource::<SpecializedRenderPipelines<LedMaterialPipeline>>()
             .init_resource::<LedMaterialPipeline>()
             .add_render_graph_node::<ViewNodeRunner<ComputeNode>>(Core3d, ComputeNodeLabel)
@@ -141,8 +184,8 @@ impl Plugin for NannouPixelmapPlugin {
 // Components & Resources
 // -------------------------
 
-#[derive(Event)]
-pub struct LedData(pub Entity, pub Vec<f32>);
+#[derive(Event, Deref, DerefMut, Debug)]
+pub struct ReceivedData(pub Vec<f32>);
 
 #[derive(Resource, Deref)]
 struct LedDataReceiver(Receiver<(Entity, Vec<f32>)>);
@@ -203,6 +246,7 @@ pub struct LedArea {
     pub rotation: f32,
     pub position: Vec2,
     pub size: Vec2,
+    pub num_samples: u32,
 }
 
 impl Default for LedArea {
@@ -212,6 +256,7 @@ impl Default for LedArea {
             rotation: 0.0,
             position: Vec2::ZERO,
             size: Vec2::ONE,
+            num_samples: 10,
         }
     }
 }
@@ -245,9 +290,9 @@ pub struct ViewLeds {
 // Systems
 // -------------------------
 
-fn send_led_data(mut receiver: ResMut<LedDataReceiver>, mut events: EventWriter<LedData>) {
+fn send_led_data(mut commands: Commands, mut receiver: ResMut<LedDataReceiver>) {
     while let Ok((entity, data)) = receiver.0.try_recv() {
-        events.send(LedData(entity, data));
+        commands.trigger_targets(ReceivedData(data), entity);
     }
 }
 
@@ -263,11 +308,9 @@ fn spawn_screen_textures(
             Option<&BloomSettings>,
         ),
         (
-            With<Camera3d>,
             With<NannouCamera>,
-            Without<ScreenTexture>,
-            Without<ScreenTextureCamera>,
-            Without<ScreenMaterialCamera>,
+            Without<ScreenTextureCameraRef>,
+            Without<ScreenMaterialCameraRef>,
         ),
     >,
     mut images: ResMut<Assets<Image>>,
@@ -284,8 +327,8 @@ fn spawn_screen_textures(
         };
 
         let size = Extent3d {
-            width: (window.physical_width()) as u32,
-            height: (window.physical_height()) as u32,
+            width: window.width() as u32,
+            height: window.height() as u32,
             ..default()
         };
         let mut image = Image {
@@ -334,7 +377,7 @@ fn spawn_screen_textures(
                     transform: cam_transform.clone(),
                     camera: Camera {
                         hdr: cam.hdr,
-                        order: cam.order + 100, // always render after the camera
+                        order: cam.order + 1, // always render after the camera
                         target: cam.target.clone(),
                         clear_color: ClearColorConfig::None,
                         ..cam.clone()
@@ -343,6 +386,10 @@ fn spawn_screen_textures(
                     ..default()
                 },
                 RenderLayers::layer(32),
+                ScreenTexture {
+                    window: window_entity,
+                    texture: image,
+                },
                 ScreenMaterialCamera,
             ))
             .id();
@@ -359,11 +406,8 @@ fn spawn_screen_textures(
         }
 
         info!("Spawning screen texture camera {screen_texture_camera} for camera {entity}");
+        info!("Spawning screen material camera {screen_material_camera} for camera {entity}");
         commands.entity(entity).insert((
-            ScreenTexture {
-                window: window_entity,
-                texture: image,
-            },
             ScreenTextureCameraRef(screen_texture_camera),
             ScreenMaterialCameraRef(screen_material_camera),
         ));
@@ -385,8 +429,8 @@ fn resize_texture(
 
             let (window) = windows_q.get(screen_texture.window).unwrap();
             let size = Extent3d {
-                width: window.physical_width(),
-                height: window.physical_height(),
+                width: window.width() as u32,
+                height: window.height() as u32,
                 ..default()
             };
             let mut image = images.get_mut(&screen_texture.texture).unwrap();
@@ -402,8 +446,8 @@ fn resize_texture(
 
             let (window) = windows_q.get(screen_texture.window).unwrap();
             let size = Extent3d {
-                width: window.physical_width() ,
-                height: window.physical_height() ,
+                width: window.width() as u32,
+                height: window.height() as u32,
                 ..default()
             };
             let mut image = images.get_mut(&screen_texture.texture).unwrap();
@@ -417,30 +461,35 @@ fn update_cameras(
         (
             &Camera,
             &Transform,
+            &Projection,
             Option<&BloomSettings>,
-            &ScreenTexture,
             &ScreenTextureCameraRef,
-            &ScreenMaterialCameraRef,
         ),
         With<NannouCamera>,
     >,
     mut update_camera_q: Query<
-        (&mut Camera, &mut Transform, Option<&mut BloomSettings>),
+        (
+            &mut Camera,
+            &mut Transform,
+            &mut Projection,
+            Option<&mut BloomSettings>,
+        ),
         Without<NannouCamera>,
     >,
 ) {
     for (
         parent_cam,
         parent_transform,
+        parent_projection,
         parent_bloom_settings,
-        screen_texture,
         screen_texture_camera,
-        screen_material_camera,
     ) in camera_q.iter()
     {
-        let (mut cam, mut cam_transform, mut bloom_settings) =
+        let (mut cam, mut transform, mut projection, mut bloom_settings) =
             update_camera_q.get_mut(screen_texture_camera.0).unwrap();
 
+        *transform = parent_transform.clone();
+        *projection = parent_projection.clone();
         cam.clear_color = parent_cam.clear_color;
         if let (Some(mut bloom_settings), Some(parent_bloom_settings)) =
             (bloom_settings, parent_bloom_settings)
@@ -452,11 +501,12 @@ fn update_cameras(
 
 fn queue_leds(
     mut commands: Commands,
-    views: Query<(Entity, &ExtractedView, &VisibleEntities), Without<ScreenTextureCamera>>,
+    views: Query<(Entity, &ExtractedView, &VisibleEntities), With<ScreenMaterialCamera>>,
     gpu_output: Res<GpuOutputBuffers>,
     leds: Query<&LedArea>,
 ) {
     for (view_entity, view, visible_entities) in views.iter() {
+        let is_orthographic = view.clip_from_view.w_axis.w == 1.0;
         let mut view_leds = ViewLeds::default();
         for visible in visible_entities.iter::<With<LedArea>>() {
             let mut idx = 0;
@@ -467,16 +517,26 @@ fn queue_leds(
                         start_index: 0,
                         rotation: led.rotation,
                         num_leds: led.count,
-                        num_samples: 10,
-                        total_area_size: led.size,
-                        area_position: led.position,
+                        num_samples: led.num_samples,
+                        total_area_size: if is_orthographic {
+                            led.size / 2.0
+                        } else {
+                            led.size
+                        },
+                        area_position: if is_orthographic {
+                            led.position / 2.0
+                        } else {
+                            led.position
+                        },
                     },
                 );
 
                 let Some(gpu_output) = gpu_output.get(&view_entity) else {
+                    warn!("No gpu_output for view {view_entity}");
                     continue;
                 };
                 let Some(buffer) = gpu_output.buffer() else {
+                    warn!("No buffer for view {view_entity}");
                     continue;
                 };
 
@@ -495,6 +555,7 @@ fn queue_leds(
                 idx += 1;
             }
         }
+
         commands.entity(view_entity).insert(view_leds);
     }
 }
@@ -663,36 +724,39 @@ fn map_and_read_buffer(
 
 #[allow(clippy::too_many_arguments)]
 fn queue_led_material(
-    transparent_3d_draw_functions: Res<DrawFunctions<Transparent3d>>,
+    draw_functions: Res<DrawFunctions<Opaque3d>>,
     custom_pipeline: Res<LedMaterialPipeline>,
     msaa: Res<Msaa>,
     mut pipelines: ResMut<SpecializedRenderPipelines<LedMaterialPipeline>>,
     pipeline_cache: Res<PipelineCache>,
-    materials: Query<Entity, With<LedArea>>,
-    mut transparent_render_phases: ResMut<ViewSortedRenderPhases<Transparent3d>>,
-    mut views: Query<(Entity, &ExtractedView), Without<ScreenTextureCamera>>,
+    mut phases: ResMut<ViewBinnedRenderPhases<Opaque3d>>,
+    mut views: Query<(Entity, &ExtractedView, &ViewLeds), With<ScreenMaterialCamera>>,
 ) {
-    let draw_function = transparent_3d_draw_functions.read().id::<DrawLedMaterial>();
+    let draw_function = draw_functions.read().id::<DrawLedMaterial>();
 
-    for (view_entity, view) in &mut views {
-        let Some(transparent_phase) = transparent_render_phases.get_mut(&view_entity) else {
+    for (view_entity, view, view_leds) in &mut views {
+        let Some(phase) = phases.get_mut(&view_entity) else {
+            warn!("No phase for view {view_entity}");
             continue;
         };
 
-        for entity in &materials {
+        for (entity, _) in &view_leds.materials {
             let key = LedMaterialPipelineKey {
                 hdr: view.hdr,
                 samples: msaa.samples(),
             };
             let pipeline = pipelines.specialize(&pipeline_cache, &custom_pipeline, key);
-            transparent_phase.add(Transparent3d {
-                entity,
-                pipeline,
-                draw_function,
-                distance: 0.0,
-                batch_range: 0..1,
-                extra_index: PhaseItemExtraIndex::NONE,
-            });
+            phase.add(
+                Opaque3dBinKey {
+                    draw_function,
+                    pipeline,
+                    asset_id: AssetId::<Mesh>::invalid().untyped(),
+                    material_bind_group_id: None,
+                    lightmap_image: None,
+                },
+                *entity,
+                BinnedRenderPhaseType::NonMesh,
+            );
         }
     }
 }
